@@ -1,11 +1,11 @@
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useRef, useMemo } from 'react'
 import {
   Excalidraw,
   convertToExcalidrawElements,
   CaptureUpdateAction,
   ExcalidrawImperativeAPI
 } from '@excalidraw/excalidraw'
-import type { ExcalidrawElement, NonDeleted, NonDeletedExcalidrawElement } from '@excalidraw/excalidraw/types/element/types'
+import type { ExcalidrawElement } from '@excalidraw/excalidraw/types/element/types'
 import { convertMermaidToExcalidraw, DEFAULT_MERMAID_CONFIG } from './utils/mermaidConverter'
 import type { MermaidConfig } from '@excalidraw/mermaid-to-excalidraw'
 
@@ -51,6 +51,8 @@ interface WebSocketMessage {
   source?: string;
   mermaidDiagram?: string;
   config?: MermaidConfig;
+  sessionId?: string;
+  createdAt?: string;
 }
 
 interface ApiResponse {
@@ -63,6 +65,16 @@ interface ApiResponse {
 }
 
 type SyncStatus = 'idle' | 'syncing' | 'success' | 'error';
+
+// Extract session ID from URL
+function getSessionIdFromUrl(): string | null {
+  const pathParts = window.location.pathname.split('/');
+  const canvasIndex = pathParts.indexOf('canvas');
+  if (canvasIndex !== -1 && pathParts[canvasIndex + 1]) {
+    return pathParts[canvasIndex + 1];
+  }
+  return null;
+}
 
 // Helper function to clean elements for Excalidraw
 const cleanElementForExcalidraw = (element: ServerElement): Partial<ExcalidrawElement> => {
@@ -85,39 +97,28 @@ const validateAndFixBindings = (elements: Partial<ExcalidrawElement>[]): Partial
   return elements.map(element => {
     const fixedElement = { ...element };
     
-    // Validate and fix boundElements
     if (fixedElement.boundElements) {
       if (Array.isArray(fixedElement.boundElements)) {
         fixedElement.boundElements = fixedElement.boundElements.filter((binding: any) => {
-          // Ensure binding has required properties
           if (!binding || typeof binding !== 'object') return false;
           if (!binding.id || !binding.type) return false;
-          
-          // Ensure the referenced element exists
           const referencedElement = elementMap.get(binding.id);
           if (!referencedElement) return false;
-          
-          // Validate binding type
           if (!['text', 'arrow'].includes(binding.type)) return false;
-          
           return true;
         });
         
-        // Remove boundElements if empty
         if (fixedElement.boundElements.length === 0) {
           fixedElement.boundElements = null;
         }
       } else {
-        // Invalid boundElements format, set to null
         fixedElement.boundElements = null;
       }
     }
     
-    // Validate and fix containerId
     if (fixedElement.containerId) {
       const containerElement = elementMap.get(fixedElement.containerId);
       if (!containerElement) {
-        // Container doesn't exist, remove containerId
         fixedElement.containerId = null;
       }
     }
@@ -131,9 +132,21 @@ function App(): JSX.Element {
   const [isConnected, setIsConnected] = useState<boolean>(false)
   const websocketRef = useRef<WebSocket | null>(null)
   
+  // Session state
+  const sessionId = useMemo(() => getSessionIdFromUrl(), []);
+  const [sessionCreatedAt, setSessionCreatedAt] = useState<string | null>(null);
+  
   // Sync state management
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('idle')
   const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null)
+
+  // Build API URL based on session
+  const getApiUrl = (path: string): string => {
+    if (sessionId) {
+      return `/api/sessions/${sessionId}${path}`;
+    }
+    return `/api${path}`;
+  };
 
   // WebSocket connection
   useEffect(() => {
@@ -143,14 +156,13 @@ function App(): JSX.Element {
         websocketRef.current.close()
       }
     }
-  }, [])
+  }, [sessionId])
 
   // Load existing elements when Excalidraw API becomes available
   useEffect(() => {
     if (excalidrawAPI) {
       loadExistingElements()
       
-      // Ensure WebSocket is connected for real-time updates
       if (!isConnected) {
         connectWebSocket()
       }
@@ -159,7 +171,7 @@ function App(): JSX.Element {
 
   const loadExistingElements = async (): Promise<void> => {
     try {
-      const response = await fetch('/api/elements')
+      const response = await fetch(getApiUrl('/elements'))
       const result: ApiResponse = await response.json()
       
       if (result.success && result.elements && result.elements.length > 0) {
@@ -178,7 +190,9 @@ function App(): JSX.Element {
     }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const wsUrl = `${protocol}//${window.location.host}`
+    const wsUrl = sessionId 
+      ? `${protocol}//${window.location.host}?sessionId=${sessionId}`
+      : `${protocol}//${window.location.host}`
     
     websocketRef.current = new WebSocket(wsUrl)
     
@@ -202,7 +216,6 @@ function App(): JSX.Element {
     websocketRef.current.onclose = (event: CloseEvent) => {
       setIsConnected(false)
       
-      // Reconnect after 3 seconds if not a clean close
       if (event.code !== 1000) {
         setTimeout(connectWebSocket, 3000)
       }
@@ -215,21 +228,27 @@ function App(): JSX.Element {
   }
 
   const handleWebSocketMessage = async (data: WebSocketMessage): Promise<void> => {
-    if (!excalidrawAPI) {
+    if (!excalidrawAPI && data.type !== 'session_info') {
       return
     }
 
     try {
-      const currentElements = excalidrawAPI.getSceneElements()
-      console.log('Current elements:', currentElements);
+      const currentElements = excalidrawAPI?.getSceneElements() || [];
 
       switch (data.type) {
+        case 'session_info':
+          if (data.sessionId) {
+            console.log(`Connected to session: ${data.sessionId}`);
+            setSessionCreatedAt(data.createdAt || null);
+          }
+          break;
+          
         case 'initial_elements':
           if (data.elements && data.elements.length > 0) {
             const cleanedElements = data.elements.map(cleanElementForExcalidraw)
             const validatedElements = validateAndFixBindings(cleanedElements)
             const convertedElements = convertToExcalidrawElements(validatedElements)
-            excalidrawAPI.updateScene({
+            excalidrawAPI?.updateScene({
               elements: convertedElements,
               captureUpdate: CaptureUpdateAction.NEVER
             })
@@ -241,7 +260,7 @@ function App(): JSX.Element {
             const cleanedNewElement = cleanElementForExcalidraw(data.element)
             const newElement = convertToExcalidrawElements([cleanedNewElement])
             const updatedElementsAfterCreate = [...currentElements, ...newElement]
-            excalidrawAPI.updateScene({ 
+            excalidrawAPI?.updateScene({ 
               elements: updatedElementsAfterCreate,
               captureUpdate: CaptureUpdateAction.NEVER
             })
@@ -255,7 +274,7 @@ function App(): JSX.Element {
             const updatedElements = currentElements.map(el =>
               el.id === data.element!.id ? convertedUpdatedElement : el
             )
-            excalidrawAPI.updateScene({
+            excalidrawAPI?.updateScene({
               elements: updatedElements,
               captureUpdate: CaptureUpdateAction.NEVER
             })
@@ -265,7 +284,7 @@ function App(): JSX.Element {
         case 'element_deleted':
           if (data.elementId) {
             const filteredElements = currentElements.filter(el => el.id !== data.elementId)
-            excalidrawAPI.updateScene({
+            excalidrawAPI?.updateScene({
               elements: filteredElements,
               captureUpdate: CaptureUpdateAction.NEVER
             })
@@ -277,7 +296,7 @@ function App(): JSX.Element {
             const cleanedBatchElements = data.elements.map(cleanElementForExcalidraw)
             const batchElements = convertToExcalidrawElements(cleanedBatchElements)
             const updatedElementsAfterBatch = [...currentElements, ...batchElements]
-            excalidrawAPI.updateScene({ 
+            excalidrawAPI?.updateScene({ 
               elements: updatedElementsAfterBatch,
               captureUpdate: CaptureUpdateAction.NEVER
             })
@@ -286,7 +305,6 @@ function App(): JSX.Element {
           
         case 'elements_synced':
           console.log(`Sync confirmed by server: ${data.count} elements`)
-          // Sync confirmation already handled by HTTP response
           break
           
         case 'sync_status':
@@ -306,18 +324,16 @@ function App(): JSX.Element {
 
               if (result.elements && result.elements.length > 0) {
                 const convertedElements = convertToExcalidrawElements(result.elements, { regenerateIds: false })
-                excalidrawAPI.updateScene({
+                excalidrawAPI?.updateScene({
                   elements: convertedElements,
                   captureUpdate: CaptureUpdateAction.IMMEDIATELY
                 })
 
                 if (result.files) {
-                  excalidrawAPI.addFiles(Object.values(result.files))
+                  excalidrawAPI?.addFiles(Object.values(result.files))
                 }
 
                 console.log('Mermaid diagram converted successfully:', result.elements.length, 'elements')
-
-                // Sync to backend automatically after creating elements
                 await syncToBackend()
               }
             } catch (error) {
@@ -334,24 +350,21 @@ function App(): JSX.Element {
     }
   }
 
-  // Data format conversion for backend
   const convertToBackendFormat = (element: ExcalidrawElement): ServerElement => {
     return {
       ...element
     } as ServerElement
   }
 
-  // Format sync time display
   const formatSyncTime = (time: Date | null): string => {
     if (!time) return ''
-    return time.toLocaleTimeString('zh-CN', {
+    return time.toLocaleTimeString('en-US', {
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit'
     })
   }
 
-  // Main sync function
   const syncToBackend = async (): Promise<void> => {
     if (!excalidrawAPI) {
       console.warn('Excalidraw API not available')
@@ -361,18 +374,13 @@ function App(): JSX.Element {
     setSyncStatus('syncing')
     
     try {
-      // 1. Get current elements
       const currentElements = excalidrawAPI.getSceneElements()
       console.log(`Syncing ${currentElements.length} elements to backend`)
       
-      // Filter out deleted elements
       const activeElements = currentElements.filter(el => !el.isDeleted)
-      
-      // 3. Convert to backend format
       const backendElements = activeElements.map(convertToBackendFormat)
       
-      // 4. Send to backend
-      const response = await fetch('/api/elements/sync', {
+      const response = await fetch(getApiUrl('/elements/sync'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -389,7 +397,6 @@ function App(): JSX.Element {
         setLastSyncTime(new Date())
         console.log(`Sync successful: ${result.count} elements synced`)
         
-        // Reset status after 2 seconds
         setTimeout(() => setSyncStatus('idle'), 2000)
       } else {
         const error: ApiResponse = await response.json()
@@ -405,25 +412,22 @@ function App(): JSX.Element {
   const clearCanvas = async (): Promise<void> => {
     if (excalidrawAPI) {
       try {
-        // Get all current elements and delete them from backend
-        const response = await fetch('/api/elements')
+        const response = await fetch(getApiUrl('/elements'))
         const result: ApiResponse = await response.json()
         
         if (result.success && result.elements) {
           const deletePromises = result.elements.map(element => 
-            fetch(`/api/elements/${element.id}`, { method: 'DELETE' })
+            fetch(getApiUrl(`/elements/${element.id}`), { method: 'DELETE' })
           )
           await Promise.all(deletePromises)
         }
         
-        // Clear the frontend canvas
         excalidrawAPI.updateScene({ 
           elements: [],
           captureUpdate: CaptureUpdateAction.IMMEDIATELY
         })
       } catch (error) {
         console.error('Error clearing canvas:', error)
-        // Still clear frontend even if backend fails
         excalidrawAPI.updateScene({ 
           elements: [],
           captureUpdate: CaptureUpdateAction.IMMEDIATELY
@@ -432,12 +436,31 @@ function App(): JSX.Element {
     }
   }
 
+  const copyShareLink = (): void => {
+    const shareUrl = window.location.href;
+    navigator.clipboard.writeText(shareUrl).then(() => {
+      alert('Share link copied to clipboard!');
+    }).catch(err => {
+      console.error('Failed to copy link:', err);
+    });
+  }
+
   return (
     <div className="app">
       {/* Header */}
       <div className="header">
         <h1>Excalidraw Canvas</h1>
         <div className="controls">
+          {/* Session Info */}
+          {sessionId && (
+            <div className="session-info">
+              <span className="session-badge">Session: {sessionId}</span>
+              <button className="btn-copy" onClick={copyShareLink} title="Copy share link">
+                📋 Share
+              </button>
+            </div>
+          )}
+          
           <div className="status">
             <div className={`status-dot ${isConnected ? 'status-connected' : 'status-disconnected'}`}></div>
             <span>{isConnected ? 'Connected' : 'Disconnected'}</span>
@@ -451,26 +474,26 @@ function App(): JSX.Element {
               disabled={syncStatus === 'syncing' || !excalidrawAPI}
             >
               {syncStatus === 'syncing' && <span className="spinner"></span>}
-              {syncStatus === 'syncing' ? 'Syncing...' : 'Sync to Backend'}
+              {syncStatus === 'syncing' ? 'Syncing...' : 'Sync'}
             </button>
             
             {/* Sync Status */}
             <div className="sync-status">
               {syncStatus === 'success' && (
-                <span className="sync-success">✅ Synced</span>
+                <span className="sync-success">✅</span>
               )}
               {syncStatus === 'error' && (
-                <span className="sync-error">❌ Sync Failed</span>
+                <span className="sync-error">❌</span>
               )}
               {lastSyncTime && syncStatus === 'idle' && (
                 <span className="sync-time">
-                  Last sync: {formatSyncTime(lastSyncTime)}
+                  {formatSyncTime(lastSyncTime)}
                 </span>
               )}
             </div>
           </div>
           
-          <button className="btn-secondary" onClick={clearCanvas}>Clear Canvas</button>
+          <button className="btn-secondary" onClick={clearCanvas}>Clear</button>
         </div>
       </div>
 

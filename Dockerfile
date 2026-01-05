@@ -1,6 +1,5 @@
-# Dockerfile for MCP Excalidraw Server
-# This builds the MCP server only (core product for CI/CD and GHCR)
-# The canvas server is optional and runs separately
+# Dockerfile for MCP Excalidraw Server (Hosted Mode)
+# This builds the MCP server with SSE transport for remote connections
 
 # Stage 1: Build backend (TypeScript compilation)
 FROM node:18-slim AS builder
@@ -47,12 +46,17 @@ USER nodejs
 # Set environment variables with defaults
 ENV NODE_ENV=production
 ENV EXPRESS_SERVER_URL=http://localhost:3000
-ENV ENABLE_CANVAS_SYNC=true
+ENV PUBLIC_URL=http://localhost:3000
+ENV MCP_TRANSPORT_MODE=sse
+ENV MCP_PORT=3001
 
-# Run MCP server (stdin/stdout protocol)
+# Expose MCP SSE port
+EXPOSE 3001
+
+# Run MCP server in SSE mode
 CMD ["node", "dist/index.js"]
 
 # Labels for metadata
 LABEL org.opencontainers.image.source="https://github.com/yctimlin/mcp_excalidraw"
-LABEL org.opencontainers.image.description="MCP Excalidraw Server - Model Context Protocol for AI agents"
+LABEL org.opencontainers.image.description="MCP Excalidraw Server - Hosted SSE mode for remote AI agents"
 LABEL org.opencontainers.image.licenses="MIT"

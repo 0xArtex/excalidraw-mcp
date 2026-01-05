@@ -1,13 +1,12 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
-import { WebSocketServer } from 'ws';
+import { WebSocketServer, WebSocket } from 'ws';
 import { createServer } from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import logger from './utils/logger.js';
 import { 
-  elements,
   generateId, 
   EXCALIDRAW_ELEMENT_TYPES,
   ServerElement,
@@ -20,8 +19,22 @@ import {
   SyncStatusMessage,
   InitialElementsMessage
 } from './types.js';
+import {
+  createSession,
+  getSession,
+  getOrCreateSession,
+  deleteSession,
+  getAllSessions,
+  getSessionCount,
+  getSessionStats,
+  updateSessionTitle,
+  finalizeSession,
+  startSessionCleanup,
+  generateSessionId,
+  Session
+} from './sessions.js';
+import { exportSessionToImage, startExportCleanup, closeBrowser } from './imageExport.js';
 import { z } from 'zod';
-import WebSocket from 'ws';
 
 // Load environment variables
 dotenv.config();
@@ -42,12 +55,17 @@ const staticDir = path.join(__dirname, '../dist');
 app.use(express.static(staticDir));
 // Also serve frontend assets
 app.use(express.static(path.join(__dirname, '../dist/frontend')));
+// Serve exported images
+app.use('/exports', express.static(path.join(__dirname, '../exports')));
 
-// WebSocket connections
-const clients = new Set<WebSocket>();
+// WebSocket connections per session
+const sessionClients = new Map<string, Set<WebSocket>>();
 
-// Broadcast to all connected clients
-function broadcast(message: WebSocketMessage): void {
+// Broadcast to all connected clients in a session
+function broadcastToSession(sessionId: string, message: WebSocketMessage): void {
+  const clients = sessionClients.get(sessionId);
+  if (!clients) return;
+  
   const data = JSON.stringify(message);
   clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
@@ -57,39 +75,68 @@ function broadcast(message: WebSocketMessage): void {
 }
 
 // WebSocket connection handling
-wss.on('connection', (ws: WebSocket) => {
-  clients.add(ws);
-  logger.info('New WebSocket connection established');
+wss.on('connection', (ws: WebSocket, req) => {
+  // Extract session ID from URL query params
+  const url = new URL(req.url || '', `http://${req.headers.host}`);
+  const sessionId = url.searchParams.get('sessionId') || generateSessionId();
+  
+  // Get or create session
+  const session = getOrCreateSession(sessionId);
+  
+  // Add client to session's client set
+  if (!sessionClients.has(sessionId)) {
+    sessionClients.set(sessionId, new Set());
+  }
+  sessionClients.get(sessionId)!.add(ws);
+  
+  logger.info(`New WebSocket connection for session: ${sessionId}`);
+  
+  // Send session info to new client
+  const sessionInfoMessage = {
+    type: 'session_info',
+    sessionId: session.id,
+    createdAt: session.createdAt.toISOString()
+  };
+  ws.send(JSON.stringify(sessionInfoMessage));
   
   // Send current elements to new client
   const initialMessage: InitialElementsMessage = {
     type: 'initial_elements',
-    elements: Array.from(elements.values())
+    elements: Array.from(session.elements.values())
   };
   ws.send(JSON.stringify(initialMessage));
   
   // Send sync status to new client
   const syncMessage: SyncStatusMessage = {
     type: 'sync_status',
-    elementCount: elements.size,
+    elementCount: session.elements.size,
     timestamp: new Date().toISOString()
   };
   ws.send(JSON.stringify(syncMessage));
   
   ws.on('close', () => {
-    clients.delete(ws);
-    logger.info('WebSocket connection closed');
+    const clients = sessionClients.get(sessionId);
+    if (clients) {
+      clients.delete(ws);
+      if (clients.size === 0) {
+        sessionClients.delete(sessionId);
+      }
+    }
+    logger.info(`WebSocket connection closed for session: ${sessionId}`);
   });
   
   ws.on('error', (error) => {
     logger.error('WebSocket error:', error);
-    clients.delete(ws);
+    const clients = sessionClients.get(sessionId);
+    if (clients) {
+      clients.delete(ws);
+    }
   });
 });
 
 // Schema validation
 const CreateElementSchema = z.object({
-  id: z.string().optional(), // Allow passing ID for MCP sync
+  id: z.string().optional(),
   type: z.enum(Object.values(EXCALIDRAW_ELEMENT_TYPES) as [ExcalidrawElementType, ...ExcalidrawElementType[]]),
   x: z.number(),
   y: z.number(),
@@ -132,12 +179,98 @@ const UpdateElementSchema = z.object({
   locked: z.boolean().optional()
 });
 
-// API Routes
+// ==================== SESSION ROUTES ====================
 
-// Get all elements
-app.get('/api/elements', (req: Request, res: Response) => {
+// Create a new session
+app.post('/api/sessions', (req: Request, res: Response) => {
   try {
-    const elementsArray = Array.from(elements.values());
+    const session = createSession();
+    res.json({
+      success: true,
+      session: {
+        id: session.id,
+        createdAt: session.createdAt.toISOString(),
+        canvasUrl: `/canvas/${session.id}`,
+        apiUrl: `/api/sessions/${session.id}/elements`
+      }
+    });
+  } catch (error) {
+    logger.error('Error creating session:', error);
+    res.status(500).json({
+      success: false,
+      error: (error as Error).message
+    });
+  }
+});
+
+// Get session info
+app.get('/api/sessions/:sessionId', (req: Request, res: Response) => {
+  try {
+    const sessionId = req.params.sessionId as string;
+    const session = getSession(sessionId);
+    
+    if (!session) {
+      return res.status(404).json({
+        success: false,
+        error: `Session ${sessionId} not found`
+      });
+    }
+    
+    res.json({
+      success: true,
+      session: {
+        id: session.id,
+        createdAt: session.createdAt.toISOString(),
+        lastActivity: session.lastActivity.toISOString(),
+        elementCount: session.elements.size,
+        title: session.title,
+        imageUrl: session.imageUrl,
+        isFinalized: session.isFinalized,
+        canvasUrl: `/canvas/${session.id}`
+      }
+    });
+  } catch (error) {
+    logger.error('Error getting session:', error);
+    res.status(500).json({
+      success: false,
+      error: (error as Error).message
+    });
+  }
+});
+
+// Get session stats
+app.get('/api/sessions', (req: Request, res: Response) => {
+  try {
+    const stats = getSessionStats();
+    res.json({
+      success: true,
+      stats
+    });
+  } catch (error) {
+    logger.error('Error getting session stats:', error);
+    res.status(500).json({
+      success: false,
+      error: (error as Error).message
+    });
+  }
+});
+
+// ==================== SESSION-BASED ELEMENT ROUTES ====================
+
+// Get all elements for a session
+app.get('/api/sessions/:sessionId/elements', (req: Request, res: Response) => {
+  try {
+    const sessionId = req.params.sessionId as string;
+    const session = getSession(sessionId);
+    
+    if (!session) {
+      return res.status(404).json({
+        success: false,
+        error: `Session ${sessionId} not found`
+      });
+    }
+    
+    const elementsArray = Array.from(session.elements.values());
     res.json({
       success: true,
       elements: elementsArray,
@@ -152,13 +285,15 @@ app.get('/api/elements', (req: Request, res: Response) => {
   }
 });
 
-// Create new element
-app.post('/api/elements', (req: Request, res: Response) => {
+// Create new element in a session
+app.post('/api/sessions/:sessionId/elements', (req: Request, res: Response) => {
   try {
+    const sessionId = req.params.sessionId as string;
+    const session = getOrCreateSession(sessionId);
+    
     const params = CreateElementSchema.parse(req.body);
-    logger.info('Creating element via API', { type: params.type });
+    logger.info('Creating element via API', { sessionId, type: params.type });
 
-    // Prioritize passed ID (for MCP sync), otherwise generate new ID
     const id = params.id || generateId();
     const element: ServerElement = {
       id,
@@ -168,14 +303,14 @@ app.post('/api/elements', (req: Request, res: Response) => {
       version: 1
     };
 
-    elements.set(id, element);
+    session.elements.set(id, element);
     
-    // Broadcast to all connected clients
+    // Broadcast to all connected clients in this session
     const message: ElementCreatedMessage = {
       type: 'element_created',
       element: element
     };
-    broadcast(message);
+    broadcastToSession(sessionId, message);
     
     res.json({
       success: true,
@@ -190,20 +325,23 @@ app.post('/api/elements', (req: Request, res: Response) => {
   }
 });
 
-// Update element
-app.put('/api/elements/:id', (req: Request, res: Response) => {
+// Update element in a session
+app.put('/api/sessions/:sessionId/elements/:id', (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
-    const updates = UpdateElementSchema.parse({ id, ...req.body });
+    const sessionId = req.params.sessionId as string;
+    const id = req.params.id as string;
+    const session = getSession(sessionId);
     
-    if (!id) {
-      return res.status(400).json({
+    if (!session) {
+      return res.status(404).json({
         success: false,
-        error: 'Element ID is required'
+        error: `Session ${sessionId} not found`
       });
     }
     
-    const existingElement = elements.get(id);
+    const updates = UpdateElementSchema.parse({ id, ...req.body });
+    
+    const existingElement = session.elements.get(id);
     if (!existingElement) {
       return res.status(404).json({
         success: false,
@@ -218,14 +356,13 @@ app.put('/api/elements/:id', (req: Request, res: Response) => {
       version: (existingElement.version || 0) + 1
     };
 
-    elements.set(id, updatedElement);
+    session.elements.set(id, updatedElement);
     
-    // Broadcast to all connected clients
     const message: ElementUpdatedMessage = {
       type: 'element_updated',
       element: updatedElement
     };
-    broadcast(message);
+    broadcastToSession(sessionId, message);
     
     res.json({
       success: true,
@@ -240,33 +377,34 @@ app.put('/api/elements/:id', (req: Request, res: Response) => {
   }
 });
 
-// Delete element
-app.delete('/api/elements/:id', (req: Request, res: Response) => {
+// Delete element from a session
+app.delete('/api/sessions/:sessionId/elements/:id', (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
+    const sessionId = req.params.sessionId as string;
+    const id = req.params.id as string;
+    const session = getSession(sessionId);
     
-    if (!id) {
-      return res.status(400).json({
+    if (!session) {
+      return res.status(404).json({
         success: false,
-        error: 'Element ID is required'
+        error: `Session ${sessionId} not found`
       });
     }
     
-    if (!elements.has(id)) {
+    if (!session.elements.has(id)) {
       return res.status(404).json({
         success: false,
         error: `Element with ID ${id} not found`
       });
     }
     
-    elements.delete(id);
+    session.elements.delete(id);
     
-    // Broadcast to all connected clients
     const message: ElementDeletedMessage = {
       type: 'element_deleted',
-      elementId: id!
+      elementId: id
     };
-    broadcast(message);
+    broadcastToSession(sessionId, message);
     
     res.json({
       success: true,
@@ -281,77 +419,11 @@ app.delete('/api/elements/:id', (req: Request, res: Response) => {
   }
 });
 
-// Query elements with filters
-app.get('/api/elements/search', (req: Request, res: Response) => {
+// Batch create elements in a session
+app.post('/api/sessions/:sessionId/elements/batch', (req: Request, res: Response) => {
   try {
-    const { type, ...filters } = req.query;
-    let results = Array.from(elements.values());
-    
-    // Filter by type if specified
-    if (type && typeof type === 'string') {
-      results = results.filter(element => element.type === type);
-    }
-    
-    // Apply additional filters
-    if (Object.keys(filters).length > 0) {
-      results = results.filter(element => {
-        return Object.entries(filters).every(([key, value]) => {
-          return (element as any)[key] === value;
-        });
-      });
-    }
-    
-    res.json({
-      success: true,
-      elements: results,
-      count: results.length
-    });
-  } catch (error) {
-    logger.error('Error querying elements:', error);
-    res.status(500).json({
-      success: false,
-      error: (error as Error).message
-    });
-  }
-});
-
-// Get element by ID
-app.get('/api/elements/:id', (req: Request, res: Response) => {
-  try {
-    const { id } = req.params;
-    
-    if (!id) {
-      return res.status(400).json({
-        success: false,
-        error: 'Element ID is required'
-      });
-    }
-    
-    const element = elements.get(id);
-    
-    if (!element) {
-      return res.status(404).json({
-        success: false,
-        error: `Element with ID ${id} not found`
-      });
-    }
-    
-    res.json({
-      success: true,
-      element: element
-    });
-  } catch (error) {
-    logger.error('Error fetching element:', error);
-    res.status(500).json({
-      success: false,
-      error: (error as Error).message
-    });
-  }
-});
-
-// Batch create elements
-app.post('/api/elements/batch', (req: Request, res: Response) => {
-  try {
+    const sessionId = req.params.sessionId as string;
+    const session = getOrCreateSession(sessionId);
     const { elements: elementsToCreate } = req.body;
     
     if (!Array.isArray(elementsToCreate)) {
@@ -374,16 +446,15 @@ app.post('/api/elements/batch', (req: Request, res: Response) => {
         version: 1
       };
       
-      elements.set(id, element);
+      session.elements.set(id, element);
       createdElements.push(element);
     });
     
-    // Broadcast to all connected clients
     const message: BatchCreatedMessage = {
       type: 'elements_batch_created',
       elements: createdElements
     };
-    broadcast(message);
+    broadcastToSession(sessionId, message);
     
     res.json({
       success: true,
@@ -400,8 +471,10 @@ app.post('/api/elements/batch', (req: Request, res: Response) => {
 });
 
 // Convert Mermaid diagram to Excalidraw elements
-app.post('/api/elements/from-mermaid', (req: Request, res: Response) => {
+app.post('/api/sessions/:sessionId/elements/from-mermaid', (req: Request, res: Response) => {
   try {
+    const sessionId = req.params.sessionId as string;
+    const session = getOrCreateSession(sessionId);
     const { mermaidDiagram, config } = req.body;
     
     if (!mermaidDiagram || typeof mermaidDiagram !== 'string') {
@@ -412,19 +485,19 @@ app.post('/api/elements/from-mermaid', (req: Request, res: Response) => {
     }
     
     logger.info('Received Mermaid conversion request', { 
+      sessionId,
       diagramLength: mermaidDiagram.length,
       hasConfig: !!config 
     });
     
-    // Broadcast to all WebSocket clients to process the Mermaid diagram
-    broadcast({
+    // Broadcast to all WebSocket clients in this session to process the Mermaid diagram
+    broadcastToSession(sessionId, {
       type: 'mermaid_convert',
       mermaidDiagram,
       config: config || {},
       timestamp: new Date().toISOString()
     });
     
-    // Return the diagram for frontend processing
     res.json({
       success: true,
       mermaidDiagram,
@@ -440,17 +513,18 @@ app.post('/api/elements/from-mermaid', (req: Request, res: Response) => {
   }
 });
 
-// Sync elements from frontend (overwrite sync)
-app.post('/api/elements/sync', (req: Request, res: Response) => {
+// Sync elements from frontend
+app.post('/api/sessions/:sessionId/elements/sync', (req: Request, res: Response) => {
   try {
+    const sessionId = req.params.sessionId as string;
+    const session = getOrCreateSession(sessionId);
     const { elements: frontendElements, timestamp } = req.body;
     
-    logger.info(`Sync request received: ${frontendElements.length} elements`, {
+    logger.info(`Sync request received for session ${sessionId}: ${frontendElements.length} elements`, {
       timestamp,
       elementCount: frontendElements.length
     });
     
-    // Validate input data
     if (!Array.isArray(frontendElements)) {
       return res.status(400).json({
         success: false,
@@ -458,23 +532,14 @@ app.post('/api/elements/sync', (req: Request, res: Response) => {
       });
     }
     
-    // Record element count before sync
-    const beforeCount = elements.size;
+    const beforeCount = session.elements.size;
+    session.elements.clear();
     
-    // 1. Clear existing memory storage
-    elements.clear();
-    logger.info(`Cleared existing elements: ${beforeCount} elements removed`);
-    
-    // 2. Batch write new data
     let successCount = 0;
-    const processedElements: ServerElement[] = [];
     
-    frontendElements.forEach((element: any, index: number) => {
+    frontendElements.forEach((element: any) => {
       try {
-        // Ensure element has ID, generate one if missing
         const elementId = element.id || generateId();
-        
-        // Add server metadata
         const processedElement: ServerElement = {
           ...element,
           id: elementId,
@@ -484,34 +549,29 @@ app.post('/api/elements/sync', (req: Request, res: Response) => {
           version: 1
         };
         
-        // Store to memory
-        elements.set(elementId, processedElement);
-        processedElements.push(processedElement);
+        session.elements.set(elementId, processedElement);
         successCount++;
-        
       } catch (elementError) {
-        logger.warn(`Failed to process element ${index}:`, elementError);
+        logger.warn(`Failed to process element:`, elementError);
       }
     });
     
-    logger.info(`Sync completed: ${successCount}/${frontendElements.length} elements synced`);
+    logger.info(`Sync completed for session ${sessionId}: ${successCount}/${frontendElements.length} elements synced`);
     
-    // 3. Broadcast sync event to all WebSocket clients
-    broadcast({
+    broadcastToSession(sessionId, {
       type: 'elements_synced',
       count: successCount,
       timestamp: new Date().toISOString(),
       source: 'manual_sync'
     });
     
-    // 4. Return sync results
     res.json({
       success: true,
       message: `Successfully synced ${successCount} elements`,
       count: successCount,
       syncedAt: new Date().toISOString(),
       beforeCount,
-      afterCount: elements.size
+      afterCount: session.elements.size
     });
     
   } catch (error) {
@@ -524,8 +584,122 @@ app.post('/api/elements/sync', (req: Request, res: Response) => {
   }
 });
 
-// Serve the frontend
-app.get('/', (req: Request, res: Response) => {
+// Export session to image
+app.post('/api/sessions/:sessionId/export', async (req: Request, res: Response) => {
+  try {
+    const sessionId = req.params.sessionId as string;
+    const { title } = req.body;
+    const session = getSession(sessionId);
+    
+    if (!session) {
+      return res.status(404).json({
+        success: false,
+        error: `Session ${sessionId} not found`
+      });
+    }
+    
+    // Update title if provided
+    if (title) {
+      updateSessionTitle(sessionId, title);
+    }
+    
+    // Export to image
+    const result = await exportSessionToImage(sessionId);
+    
+    if (!result.success) {
+      return res.status(500).json({
+        success: false,
+        error: result.error
+      });
+    }
+    
+    // Mark session as finalized
+    finalizeSession(sessionId, result.imageUrl!);
+    
+    const baseUrl = process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`;
+    
+    res.json({
+      success: true,
+      sessionId,
+      title: session.title,
+      canvasUrl: `${baseUrl}/canvas/${sessionId}`,
+      imageUrl: result.imageUrl,
+      message: 'Diagram exported successfully!'
+    });
+  } catch (error) {
+    logger.error('Error exporting session:', error);
+    res.status(500).json({
+      success: false,
+      error: (error as Error).message
+    });
+  }
+});
+
+// ==================== LEGACY ROUTES (for backward compatibility) ====================
+
+// Default session for legacy API calls
+const DEFAULT_SESSION_ID = 'default';
+
+// Get all elements (legacy)
+app.get('/api/elements', (req: Request, res: Response) => {
+  try {
+    const session = getOrCreateSession(DEFAULT_SESSION_ID);
+    const elementsArray = Array.from(session.elements.values());
+    res.json({
+      success: true,
+      elements: elementsArray,
+      count: elementsArray.length
+    });
+  } catch (error) {
+    logger.error('Error fetching elements:', error);
+    res.status(500).json({
+      success: false,
+      error: (error as Error).message
+    });
+  }
+});
+
+// Create new element (legacy)
+app.post('/api/elements', (req: Request, res: Response) => {
+  try {
+    const session = getOrCreateSession(DEFAULT_SESSION_ID);
+    const params = CreateElementSchema.parse(req.body);
+    logger.info('Creating element via API (legacy)', { type: params.type });
+
+    const id = params.id || generateId();
+    const element: ServerElement = {
+      id,
+      ...params,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      version: 1
+    };
+
+    session.elements.set(id, element);
+    
+    const message: ElementCreatedMessage = {
+      type: 'element_created',
+      element: element
+    };
+    broadcastToSession(DEFAULT_SESSION_ID, message);
+    
+    res.json({
+      success: true,
+      element: element
+    });
+  } catch (error) {
+    logger.error('Error creating element:', error);
+    res.status(400).json({
+      success: false,
+      error: (error as Error).message
+    });
+  }
+});
+
+// ==================== CANVAS ROUTES ====================
+
+// Serve the frontend for session-based canvas
+app.get('/canvas/:sessionId', (req: Request, res: Response) => {
   const htmlFile = path.join(__dirname, '../dist/frontend/index.html');
   res.sendFile(htmlFile, (err) => {
     if (err) {
@@ -535,27 +709,45 @@ app.get('/', (req: Request, res: Response) => {
   });
 });
 
+// Serve the frontend (default - creates new session)
+app.get('/', (req: Request, res: Response) => {
+  // Redirect to a new session
+  const newSessionId = generateSessionId();
+  res.redirect(`/canvas/${newSessionId}`);
+});
+
 // Health check endpoint
 app.get('/health', (req: Request, res: Response) => {
+  const stats = getSessionStats();
+  const publicUrl = process.env.PUBLIC_URL || 
+    (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : `http://localhost:${process.env.PORT || 3000}`);
+  
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    elements_count: elements.size,
-    websocket_clients: clients.size
+    sessions: stats,
+    websocket_clients: Array.from(sessionClients.values()).reduce((acc, set) => acc + set.size, 0),
+    mcp_clients: sseTransports.size,
+    endpoints: {
+      canvas: `${publicUrl}/canvas/:sessionId`,
+      mcp_sse: `${publicUrl}/sse`,
+      health: `${publicUrl}/health`
+    }
   });
 });
 
 // Sync status endpoint
 app.get('/api/sync/status', (req: Request, res: Response) => {
+  const stats = getSessionStats();
   res.json({
     success: true,
-    elementCount: elements.size,
+    sessions: stats,
     timestamp: new Date().toISOString(),
     memoryUsage: {
-      heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024), // MB
-      heapTotal: Math.round(process.memoryUsage().heapTotal / 1024 / 1024), // MB
+      heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+      heapTotal: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
     },
-    websocketClients: clients.size
+    websocketClients: Array.from(sessionClients.values()).reduce((acc, set) => acc + set.size, 0)
   });
 });
 
@@ -568,13 +760,123 @@ app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
   });
 });
 
+// ==================== MCP SSE ENDPOINTS ====================
+// These endpoints allow remote AI agents to connect via SSE transport
+
+import { Server as McpServer } from '@modelcontextprotocol/sdk/server/index.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { handleMcpToolCall, mcpTools, setCurrentSession } from './mcp-handler.js';
+
+// Store active SSE transports
+const sseTransports = new Map<string, SSEServerTransport>();
+const mcpServers = new Map<string, McpServer>();
+
+// Create MCP server for a session
+function createMcpServerForSession(sessionId: string): McpServer {
+  const mcpServer = new McpServer(
+    {
+      name: "mcp-excalidraw-server",
+      version: "2.0.0",
+      description: "Create diagrams with AI and get shareable links"
+    },
+    {
+      capabilities: {
+        tools: Object.fromEntries(mcpTools.map(tool => [tool.name, {
+          description: tool.description,
+          inputSchema: tool.inputSchema
+        }]))
+      }
+    }
+  );
+  
+  mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
+    setCurrentSession(sessionId);
+    return handleMcpToolCall(request.params.name, request.params.arguments);
+  });
+  
+  mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
+    return { tools: mcpTools };
+  });
+  
+  mcpServers.set(sessionId, mcpServer);
+  return mcpServer;
+}
+
+// SSE endpoint for MCP connections
+app.get('/sse', async (req: Request, res: Response) => {
+  logger.info('New MCP SSE connection request');
+  
+  const session = createSession();
+  const sessionId = session.id;
+  
+  const messageEndpoint = `/messages/${sessionId}`;
+  const transport = new SSEServerTransport(messageEndpoint, res);
+  sseTransports.set(sessionId, transport);
+  
+  const mcpServer = createMcpServerForSession(sessionId);
+  
+  res.on('close', () => {
+    logger.info(`SSE connection closed: ${sessionId}`);
+    sseTransports.delete(sessionId);
+    mcpServers.delete(sessionId);
+  });
+  
+  await mcpServer.connect(transport);
+  logger.info(`MCP SSE connected: ${sessionId}`);
+});
+
+// Messages endpoint for SSE
+app.post('/messages/:sessionId', async (req: Request, res: Response) => {
+  const sessionId = req.params.sessionId as string;
+  
+  if (!sessionId) {
+    return res.status(400).json({ error: 'Session ID required' });
+  }
+  
+  const transport = sseTransports.get(sessionId);
+  
+  if (transport) {
+    setCurrentSession(sessionId);
+    await transport.handlePostMessage(req, res);
+  } else {
+    res.status(404).json({ error: `Session not found: ${sessionId}` });
+  }
+});
+
+// MCP health check
+app.get('/mcp/health', (req: Request, res: Response) => {
+  res.json({
+    status: 'healthy',
+    activeSessions: sseTransports.size,
+    timestamp: new Date().toISOString()
+  });
+});
+
 // Start server
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const HOST = process.env.HOST || 'localhost';
+const HOST = process.env.HOST || '0.0.0.0'; // Listen on all interfaces for Docker
 
 server.listen(PORT, HOST, () => {
-  logger.info(`POC server running on http://${HOST}:${PORT}`);
+  logger.info(`Canvas server running on http://${HOST}:${PORT}`);
   logger.info(`WebSocket server running on ws://${HOST}:${PORT}`);
+  
+  // Start cleanup jobs
+  startSessionCleanup();
+  startExportCleanup();
+});
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM received, shutting down...');
+  await closeBrowser();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  logger.info('SIGINT received, shutting down...');
+  await closeBrowser();
+  process.exit(0);
 });
 
 export default app;

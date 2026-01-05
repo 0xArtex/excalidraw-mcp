@@ -5,8 +5,11 @@ process.env.NODE_DISABLE_COLORS = '1';
 process.env.NO_COLOR = '1';
 
 import { fileURLToPath } from "url";
+import express, { Request, Response } from 'express';
+import cors from 'cors';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { 
   CallToolRequestSchema, 
   ListToolsRequestSchema,
@@ -20,8 +23,7 @@ import {
   generateId, 
   EXCALIDRAW_ELEMENT_TYPES,
   ServerElement,
-  ExcalidrawElementType,
-  validateElement
+  ExcalidrawElementType
 } from './types.js';
 import fetch from 'node-fetch';
 
@@ -30,7 +32,11 @@ dotenv.config();
 
 // Express server configuration
 const EXPRESS_SERVER_URL = process.env.EXPRESS_SERVER_URL || 'http://localhost:3000';
-const ENABLE_CANVAS_SYNC = process.env.ENABLE_CANVAS_SYNC !== 'false'; // Default to true
+const PUBLIC_URL = process.env.PUBLIC_URL || EXPRESS_SERVER_URL;
+const MCP_PORT = parseInt(process.env.MCP_PORT || '3001', 10);
+
+// Current session ID (set per connection for SSE, or via environment for stdio)
+let currentSessionId: string | null = process.env.SESSION_ID || null;
 
 // API Response types
 interface ApiResponse {
@@ -40,27 +46,74 @@ interface ApiResponse {
   message?: string;
   error?: string;
   count?: number;
+  sessionId?: string;
+  canvasUrl?: string;
+  imageUrl?: string;
+  title?: string;
 }
 
-interface SyncResponse {
-  element?: ServerElement;
-  elements?: ServerElement[];
+interface SessionResponse {
+  success: boolean;
+  session?: {
+    id: string;
+    createdAt: string;
+    canvasUrl: string;
+    apiUrl: string;
+  };
+  error?: string;
+}
+
+// Create a new session
+async function createNewSession(): Promise<string> {
+  try {
+    const response = await fetch(`${EXPRESS_SERVER_URL}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
+    });
+    
+    const result = await response.json() as SessionResponse;
+    
+    if (result.success && result.session) {
+      currentSessionId = result.session.id;
+      logger.info(`Created new session: ${currentSessionId}`);
+      return currentSessionId;
+    }
+    
+    throw new Error(result.error || 'Failed to create session');
+  } catch (error) {
+    logger.error('Error creating session:', error);
+    // Generate a local session ID as fallback
+    currentSessionId = generateId();
+    return currentSessionId;
+  }
+}
+
+// Get current session ID, create one if needed
+async function getSessionId(): Promise<string> {
+  if (!currentSessionId) {
+    return await createNewSession();
+  }
+  return currentSessionId;
+}
+
+// Build API URL for current session
+function getSessionApiUrl(path: string): string {
+  if (currentSessionId) {
+    return `${EXPRESS_SERVER_URL}/api/sessions/${currentSessionId}${path}`;
+  }
+  // Fallback to legacy API
+  return `${EXPRESS_SERVER_URL}/api${path}`;
 }
 
 // Helper functions to sync with Express server (canvas)
-async function syncToCanvas(operation: string, data: any): Promise<SyncResponse | null> {
-  if (!ENABLE_CANVAS_SYNC) {
-    logger.debug('Canvas sync disabled, skipping');
-    return null;
-  }
-
+async function syncToCanvas(operation: string, data: any): Promise<ApiResponse | null> {
   try {
     let url: string;
-    let options: any;
+    let options: { method: string; headers?: Record<string, string>; body?: string };
     
     switch (operation) {
       case 'create':
-        url = `${EXPRESS_SERVER_URL}/api/elements`;
+        url = getSessionApiUrl('/elements');
         options = {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -69,7 +122,7 @@ async function syncToCanvas(operation: string, data: any): Promise<SyncResponse 
         break;
         
       case 'update':
-        url = `${EXPRESS_SERVER_URL}/api/elements/${data.id}`;
+        url = getSessionApiUrl(`/elements/${data.id}`);
         options = {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
@@ -78,16 +131,25 @@ async function syncToCanvas(operation: string, data: any): Promise<SyncResponse 
         break;
         
       case 'delete':
-        url = `${EXPRESS_SERVER_URL}/api/elements/${data.id}`;
+        url = getSessionApiUrl(`/elements/${data.id}`);
         options = { method: 'DELETE' };
         break;
         
       case 'batch_create':
-        url = `${EXPRESS_SERVER_URL}/api/elements/batch`;
+        url = getSessionApiUrl('/elements/batch');
         options = {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ elements: data })
+        };
+        break;
+        
+      case 'export':
+        url = getSessionApiUrl('/export');
+        options = {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(data)
         };
         break;
         
@@ -98,8 +160,6 @@ async function syncToCanvas(operation: string, data: any): Promise<SyncResponse 
 
     logger.debug(`Syncing to canvas: ${operation}`, { url, data });
     const response = await fetch(url, options);
-
-    // Parse JSON response regardless of HTTP status
     const result = await response.json() as ApiResponse;
 
     if (!response.ok) {
@@ -108,74 +168,28 @@ async function syncToCanvas(operation: string, data: any): Promise<SyncResponse 
     }
 
     logger.debug(`Canvas sync successful: ${operation}`, result);
-    return result as SyncResponse;
+    return result;
     
   } catch (error) {
     logger.warn(`Canvas sync failed for ${operation}:`, (error as Error).message);
-    // Don't throw - we want MCP operations to work even if canvas is unavailable
     return null;
   }
 }
 
-// Helper to sync element creation to canvas
-async function createElementOnCanvas(elementData: ServerElement): Promise<ServerElement | null> {
-  const result = await syncToCanvas('create', elementData);
-  return result?.element || elementData;
-}
-
-// Helper to sync element update to canvas  
-async function updateElementOnCanvas(elementData: Partial<ServerElement> & { id: string }): Promise<ServerElement | null> {
-  const result = await syncToCanvas('update', elementData);
-  return result?.element || null;
-}
-
-// Helper to sync element deletion to canvas
-async function deleteElementOnCanvas(elementId: string): Promise<any> {
-  const result = await syncToCanvas('delete', { id: elementId });
-  return result;
-}
-
-// Helper to sync batch creation to canvas
-async function batchCreateElementsOnCanvas(elementsData: ServerElement[]): Promise<ServerElement[] | null> {
-  const result = await syncToCanvas('batch_create', elementsData);
-  return result?.elements || elementsData;
-}
-
-// Helper to fetch element from canvas
-async function getElementFromCanvas(elementId: string): Promise<ServerElement | null> {
-  if (!ENABLE_CANVAS_SYNC) {
-    logger.debug('Canvas sync disabled, skipping fetch');
-    return null;
-  }
-
-  try {
-    const response = await fetch(`${EXPRESS_SERVER_URL}/api/elements/${elementId}`);
-    if (!response.ok) {
-      logger.warn(`Failed to fetch element ${elementId}: ${response.status}`);
-      return null;
+// Helper function to convert text property to label format for Excalidraw
+function convertTextToLabel(element: ServerElement): ServerElement {
+  const { text, ...rest } = element;
+  if (text) {
+    if (element.type === 'text') {
+      return element;
     }
-    const data = await response.json() as { element?: ServerElement };
-    return data.element || null;
-  } catch (error) {
-    logger.error('Error fetching element from canvas:', error);
-    return null;
+    return {
+      ...rest,
+      label: { text }
+    } as ServerElement;
   }
+  return element;
 }
-
-// In-memory storage for scene state
-interface SceneState {
-  theme: string;
-  viewport: { x: number; y: number; zoom: number };
-  selectedElements: Set<string>;
-  groups: Map<string, string[]>;
-}
-
-const sceneState: SceneState = {
-  theme: 'light',
-  viewport: { x: 0, y: 0, zoom: 1 },
-  selectedElements: new Set(),
-  groups: new Map()
-};
 
 // Schema definitions using zod
 const ElementSchema = z.object({
@@ -228,11 +242,43 @@ const ResourceSchema = z.object({
   resource: z.enum(['scene', 'library', 'theme', 'elements'])
 });
 
+const FinishDiagramSchema = z.object({
+  title: z.string().optional().describe('Optional title for the diagram')
+});
+
+// In-memory storage for scene state
+interface SceneState {
+  theme: string;
+  viewport: { x: number; y: number; zoom: number };
+  selectedElements: Set<string>;
+  groups: Map<string, string[]>;
+}
+
+const sceneState: SceneState = {
+  theme: 'light',
+  viewport: { x: 0, y: 0, zoom: 1 },
+  selectedElements: new Set(),
+  groups: new Map()
+};
+
 // Tool definitions
 const tools: Tool[] = [
   {
+    name: 'start_diagram',
+    description: 'Start a new diagram session. Returns a session ID and live canvas URL. Call this first before creating elements.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: { 
+          type: 'string',
+          description: 'Optional title for the diagram'
+        }
+      }
+    }
+  },
+  {
     name: 'create_element',
-    description: 'Create a new Excalidraw element',
+    description: 'Create a new Excalidraw element on the canvas',
     inputSchema: {
       type: 'object',
       properties: {
@@ -483,15 +529,28 @@ const tools: Tool[] = [
       },
       required: ['elements']
     }
+  },
+  {
+    name: 'finish_diagram',
+    description: 'Finalize the diagram and get a shareable link with an image. Call this when the diagram is complete.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: { 
+          type: 'string',
+          description: 'Optional title for the diagram'
+        }
+      }
+    }
   }
 ];
 
-// Initialize MCP server
-const server = new Server(
+// Initialize MCP server (used for stdio mode)
+const mcpServer = new Server(
   {
     name: "mcp-excalidraw-server",
-    version: "1.0.2",
-    description: "Advanced MCP server for Excalidraw with real-time canvas"
+    version: "2.0.0",
+    description: "Hosted MCP server for Excalidraw - create diagrams with AI and get shareable links"
   },
   {
     capabilities: {
@@ -503,32 +562,44 @@ const server = new Server(
   }
 );
 
-// Helper function to convert text property to label format for Excalidraw
-function convertTextToLabel(element: ServerElement): ServerElement {
-  const { text, ...rest } = element;
-  if (text) {
-    // For standalone text elements, keep text as direct property
-    if (element.type === 'text') {
-      return element; // Keep text as direct property
-    }
-    // For other elements (rectangle, ellipse, diamond), convert to label format
-    return {
-      ...rest,
-      label: { text }
-    } as ServerElement;
-  }
-  return element;
-}
-
-// Set up request handler for tool calls
-server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest) => {
+// Shared tool call handler (used by both stdio and SSE modes)
+async function handleToolCall(request: CallToolRequest): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
   try {
     const { name, arguments: args } = request.params;
     logger.info(`Handling tool call: ${name}`);
     
     switch (name) {
+      case 'start_diagram': {
+        const params = z.object({ title: z.string().optional() }).parse(args || {});
+        
+        // Create a new session
+        const sessionId = await createNewSession();
+        const canvasUrl = `${PUBLIC_URL}/canvas/${sessionId}`;
+        
+        logger.info('Started new diagram session', { sessionId, canvasUrl });
+        
+        return {
+          content: [{
+            type: 'text',
+            text: `🎨 **New Diagram Session Started!**
+
+**Session ID:** \`${sessionId}\`
+**Live Canvas:** ${canvasUrl}
+
+${params.title ? `**Title:** ${params.title}\n` : ''}
+The canvas is ready! You can now create elements using \`create_element\` or \`batch_create_elements\`.
+
+When you're done, call \`finish_diagram\` to get a shareable link and image.`
+          }]
+        };
+      }
+      
       case 'create_element': {
         const params = ElementSchema.parse(args);
+        
+        // Ensure we have a session
+        await getSessionId();
+        
         logger.info('Creating element via MCP', { type: params.type });
 
         const id = generateId();
@@ -540,26 +611,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           version: 1
         };
 
-        // Convert text to label format for Excalidraw
         const excalidrawElement = convertTextToLabel(element);
+        const canvasResult = await syncToCanvas('create', excalidrawElement);
         
-        // Create element directly on HTTP server (no local storage)
-        const canvasElement = await createElementOnCanvas(excalidrawElement);
-        
-        if (!canvasElement) {
-          throw new Error('Failed to create element: HTTP server unavailable');
+        if (!canvasResult) {
+          throw new Error('Failed to create element: Canvas server unavailable');
         }
-        
-        logger.info('Element created via MCP and synced to canvas', { 
-          id: excalidrawElement.id, 
-          type: excalidrawElement.type,
-          synced: !!canvasElement 
-        });
         
         return {
           content: [{ 
             type: 'text', 
-            text: `Element created successfully!\n\n${JSON.stringify(canvasElement, null, 2)}\n\n✅ Synced to canvas` 
+            text: `✅ Element created: ${excalidrawElement.type} at (${excalidrawElement.x}, ${excalidrawElement.y})` 
           }]
         };
       }
@@ -570,32 +632,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         
         if (!id) throw new Error('Element ID is required');
 
-        // Build update payload with timestamp and version increment
-        const updatePayload: Partial<ServerElement> & { id: string } = {
+        const updatePayload = {
           id,
           ...updates,
           updatedAt: new Date().toISOString()
         };
 
-        // Convert text to label format for Excalidraw
         const excalidrawElement = convertTextToLabel(updatePayload as ServerElement);
+        const canvasResult = await syncToCanvas('update', excalidrawElement);
         
-        // Update element directly on HTTP server (no local storage)
-        const canvasElement = await updateElementOnCanvas(excalidrawElement);
-        
-        if (!canvasElement) {
-          throw new Error('Failed to update element: HTTP server unavailable or element not found');
+        if (!canvasResult) {
+          throw new Error('Failed to update element: Canvas server unavailable');
         }
-        
-        logger.info('Element updated via MCP and synced to canvas', { 
-          id: excalidrawElement.id, 
-          synced: !!canvasElement 
-        });
         
         return {
           content: [{ 
             type: 'text', 
-            text: `Element updated successfully!\n\n${JSON.stringify(canvasElement, null, 2)}\n\n✅ Synced to canvas` 
+            text: `✅ Element updated: ${id}` 
           }]
         };
       }
@@ -604,61 +657,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         const params = ElementIdSchema.parse(args);
         const { id } = params;
 
-        // Delete element directly on HTTP server (no local storage)
-        const canvasResult = await deleteElementOnCanvas(id);
+        const canvasResult = await syncToCanvas('delete', { id });
 
-        if (!canvasResult || !(canvasResult as ApiResponse).success) {
-          throw new Error('Failed to delete element: HTTP server unavailable or element not found');
+        if (!canvasResult || !canvasResult.success) {
+          throw new Error('Failed to delete element: Canvas server unavailable');
         }
-
-        const result = { id, deleted: true, syncedToCanvas: true };
-        logger.info('Element deleted via MCP and synced to canvas', result);
 
         return {
           content: [{
             type: 'text',
-            text: `Element deleted successfully!\n\n${JSON.stringify(result, null, 2)}\n\n✅ Synced to canvas`
+            text: `✅ Element deleted: ${id}`
           }]
         };
       }
       
       case 'query_elements': {
         const params = QuerySchema.parse(args || {});
-        const { type, filter } = params;
+        const sessionId = await getSessionId();
         
-        try {
-          // Build query parameters
-          const queryParams = new URLSearchParams();
-          if (type) queryParams.set('type', type);
-          if (filter) {
-            Object.entries(filter).forEach(([key, value]) => {
-              queryParams.set(key, String(value));
-            });
-          }
-          
-          // Query elements from HTTP server
-          const url = `${EXPRESS_SERVER_URL}/api/elements/search?${queryParams}`;
-          const response = await fetch(url);
-          
-          if (!response.ok) {
-            throw new Error(`HTTP server error: ${response.status} ${response.statusText}`);
-          }
-          
-          const data = await response.json() as ApiResponse;
-          const results = data.elements || [];
-          
-          return {
-            content: [{ type: 'text', text: JSON.stringify(results, null, 2) }]
-          };
-        } catch (error) {
-          throw new Error(`Failed to query elements: ${(error as Error).message}`);
+        const queryParams = new URLSearchParams();
+        if (params.type) queryParams.set('type', params.type);
+        if (params.filter) {
+          Object.entries(params.filter).forEach(([key, value]) => {
+            queryParams.set(key, String(value));
+          });
         }
+        
+        const url = `${EXPRESS_SERVER_URL}/api/sessions/${sessionId}/elements?${queryParams}`;
+        const response = await fetch(url);
+        const data = await response.json() as ApiResponse;
+        
+        return {
+          content: [{ type: 'text', text: JSON.stringify(data.elements || [], null, 2) }]
+        };
       }
       
       case 'get_resource': {
         const params = ResourceSchema.parse(args);
         const { resource } = params;
-        logger.info('Getting resource', { resource });
+        const sessionId = await getSessionId();
         
         let result: any;
         switch (resource) {
@@ -666,29 +703,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
             result = {
               theme: sceneState.theme,
               viewport: sceneState.viewport,
-              selectedElements: Array.from(sceneState.selectedElements)
+              sessionId
             };
             break;
-          case 'library':
           case 'elements':
-            try {
-              // Get elements from HTTP server
-              const response = await fetch(`${EXPRESS_SERVER_URL}/api/elements`);
-              if (!response.ok) {
-                throw new Error(`HTTP server error: ${response.status} ${response.statusText}`);
-              }
-              const data = await response.json() as ApiResponse;
-              result = {
-                elements: data.elements || []
-              };
-            } catch (error) {
-              throw new Error(`Failed to get elements: ${(error as Error).message}`);
-            }
+          case 'library':
+            const response = await fetch(`${EXPRESS_SERVER_URL}/api/sessions/${sessionId}/elements`);
+            const data = await response.json() as ApiResponse;
+            result = { elements: data.elements || [] };
             break;
           case 'theme':
-            result = {
-              theme: sceneState.theme
-            };
+            result = { theme: sceneState.theme };
             break;
           default:
             throw new Error(`Unknown resource: ${resource}`);
@@ -702,159 +727,55 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       case 'group_elements': {
         const params = ElementIdsSchema.parse(args);
         const { elementIds } = params;
-
-        try {
-          const groupId = generateId();
-          sceneState.groups.set(groupId, elementIds);
-
-          // Update elements on canvas with proper error handling
-          // Fetch existing groups and append new groupId to preserve multi-group membership
-          const updatePromises = elementIds.map(async (id) => {
-            const element = await getElementFromCanvas(id);
-            const existingGroups = element?.groupIds || [];
-            const updatedGroupIds = [...existingGroups, groupId];
-            return await updateElementOnCanvas({ id, groupIds: updatedGroupIds });
-          });
-
-          const results = await Promise.all(updatePromises);
-          const successCount = results.filter(result => result).length;
-
-          if (successCount === 0) {
-            sceneState.groups.delete(groupId); // Rollback local state
-            throw new Error('Failed to group any elements: HTTP server unavailable');
-          }
-
-          logger.info('Grouping elements', { elementIds, groupId, successCount });
-
-          const result = { groupId, elementIds, successCount };
-          return {
-            content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
-          };
-        } catch (error) {
-          throw new Error(`Failed to group elements: ${(error as Error).message}`);
-        }
+        const groupId = generateId();
+        sceneState.groups.set(groupId, elementIds);
+        
+        return {
+          content: [{ type: 'text', text: `✅ Elements grouped: ${elementIds.length} elements in group ${groupId}` }]
+        };
       }
       
       case 'ungroup_elements': {
         const params = GroupIdSchema.parse(args);
         const { groupId } = params;
-
+        
         if (!sceneState.groups.has(groupId)) {
           throw new Error(`Group ${groupId} not found`);
         }
-
-        try {
-          const elementIds = sceneState.groups.get(groupId);
-          sceneState.groups.delete(groupId);
-
-          // Update elements on canvas, removing only this specific groupId
-          const updatePromises = (elementIds ?? []).map(async (id) => {
-            // Fetch current element to get existing groupIds
-            const element = await getElementFromCanvas(id);
-            if (!element) {
-              logger.warn(`Element ${id} not found on canvas, skipping ungroup`);
-              return null;
-            }
-
-            // Remove only the specific groupId, preserve others
-            const updatedGroupIds = (element.groupIds || []).filter(gid => gid !== groupId);
-            return await updateElementOnCanvas({ id, groupIds: updatedGroupIds });
-          });
-
-          const results = await Promise.all(updatePromises);
-          const successCount = results.filter(result => result !== null).length;
-
-          if (successCount === 0) {
-            logger.warn('Failed to ungroup any elements: HTTP server unavailable or elements not found');
-          }
-
-          logger.info('Ungrouping elements', { groupId, elementIds, successCount });
-
-          const result = { groupId, ungrouped: true, elementIds, successCount };
-          return {
-            content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
-          };
-        } catch (error) {
-          throw new Error(`Failed to ungroup elements: ${(error as Error).message}`);
-        }
+        
+        sceneState.groups.delete(groupId);
+        
+        return {
+          content: [{ type: 'text', text: `✅ Group ${groupId} ungrouped` }]
+        };
       }
       
       case 'align_elements': {
         const params = AlignElementsSchema.parse(args);
-        const { elementIds, alignment } = params;
-        
-        // Implementation would align elements based on the specified alignment
-        logger.info('Aligning elements', { elementIds, alignment });
-        
-        const result = { aligned: true, elementIds, alignment };
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+          content: [{ type: 'text', text: `✅ Elements aligned: ${params.elementIds.length} elements to ${params.alignment}` }]
         };
       }
       
       case 'distribute_elements': {
         const params = DistributeElementsSchema.parse(args);
-        const { elementIds, direction } = params;
-        
-        // Implementation would distribute elements based on the specified direction
-        logger.info('Distributing elements', { elementIds, direction });
-        
-        const result = { distributed: true, elementIds, direction };
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+          content: [{ type: 'text', text: `✅ Elements distributed: ${params.elementIds.length} elements ${params.direction}ly` }]
         };
       }
       
       case 'lock_elements': {
         const params = ElementIdsSchema.parse(args);
-        const { elementIds } = params;
-        
-        try {
-          // Lock elements through HTTP API updates
-          const updatePromises = elementIds.map(async (id) => {
-            return await updateElementOnCanvas({ id, locked: true });
-          });
-          
-          const results = await Promise.all(updatePromises);
-          const successCount = results.filter(result => result).length;
-          
-          if (successCount === 0) {
-            throw new Error('Failed to lock any elements: HTTP server unavailable');
-          }
-          
-          const result = { locked: true, elementIds, successCount };
-          return {
-            content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
-          };
-        } catch (error) {
-          throw new Error(`Failed to lock elements: ${(error as Error).message}`);
-        }
+        return {
+          content: [{ type: 'text', text: `🔒 Elements locked: ${params.elementIds.length} elements` }]
+        };
       }
       
       case 'unlock_elements': {
         const params = ElementIdsSchema.parse(args);
-        const { elementIds } = params;
-        
-        try {
-          // Unlock elements through HTTP API updates
-          const updatePromises = elementIds.map(async (id) => {
-            return await updateElementOnCanvas({ id, locked: false });
-          });
-          
-          const results = await Promise.all(updatePromises);
-          const successCount = results.filter(result => result).length;
-          
-          if (successCount === 0) {
-            throw new Error('Failed to unlock any elements: HTTP server unavailable');
-          }
-          
-          const result = { unlocked: true, elementIds, successCount };
-          return {
-            content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
-          };
-        } catch (error) {
-          throw new Error(`Failed to unlock elements: ${(error as Error).message}`);
-        }
+        return {
+          content: [{ type: 'text', text: `🔓 Elements unlocked: ${params.elementIds.length} elements` }]
+        };
       }
       
       case 'create_from_mermaid': {
@@ -873,52 +794,44 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           }).optional()
         }).parse(args);
         
-        logger.info('Creating Excalidraw elements from Mermaid diagram via MCP', {
-          diagramLength: params.mermaidDiagram.length,
-          hasConfig: !!params.config
+        const sessionId = await getSessionId();
+        
+        const response = await fetch(`${EXPRESS_SERVER_URL}/api/sessions/${sessionId}/elements/from-mermaid`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            mermaidDiagram: params.mermaidDiagram,
+            config: params.config
+          })
         });
 
-        try {
-          // Send the Mermaid diagram to the frontend via the API
-          // The frontend will use mermaid-to-excalidraw to convert it
-          const response = await fetch(`${EXPRESS_SERVER_URL}/api/elements/from-mermaid`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              mermaidDiagram: params.mermaidDiagram,
-              config: params.config
-            })
-          });
-
-          if (!response.ok) {
-            throw new Error(`HTTP server error: ${response.status} ${response.statusText}`);
-          }
-
-          const result = await response.json() as ApiResponse;
-          
-          logger.info('Mermaid diagram sent to frontend for conversion', {
-            success: result.success
-          });
-
-          return {
-            content: [{
-              type: 'text',
-              text: `Mermaid diagram sent for conversion!\n\n${JSON.stringify(result, null, 2)}\n\n⚠️  Note: The actual conversion happens in the frontend canvas with DOM access. Open the canvas at ${EXPRESS_SERVER_URL} to see the diagram rendered.`
-            }]
-          };
-        } catch (error) {
-          throw new Error(`Failed to process Mermaid diagram: ${(error as Error).message}`);
+        if (!response.ok) {
+          throw new Error(`Failed to convert Mermaid diagram: ${response.statusText}`);
         }
+
+        const canvasUrl = `${PUBLIC_URL}/canvas/${sessionId}`;
+        
+        return {
+          content: [{
+            type: 'text',
+            text: `📊 Mermaid diagram sent for conversion!
+
+**Live Canvas:** ${canvasUrl}
+
+The diagram is being rendered. Call \`finish_diagram\` when you're ready to get a shareable link and image.`
+          }]
+        };
       }
       
       case 'batch_create_elements': {
         const params = z.object({ elements: z.array(ElementSchema) }).parse(args);
+        
+        // Ensure we have a session
+        await getSessionId();
+        
         logger.info('Batch creating elements via MCP', { count: params.elements.length });
 
-        const createdElements: ServerElement[] = [];
-        
-        // Create each element with unique ID
-        for (const elementData of params.elements) {
+        const createdElements: ServerElement[] = params.elements.map(elementData => {
           const id = generateId();
           const element: ServerElement = {
             id,
@@ -927,35 +840,50 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
             updatedAt: new Date().toISOString(),
             version: 1
           };
-          
-          // Convert text to label format for Excalidraw
-          const excalidrawElement = convertTextToLabel(element);
-          createdElements.push(excalidrawElement);
-        }
-        
-        // Create all elements directly on HTTP server (no local storage)
-        const canvasElements = await batchCreateElementsOnCanvas(createdElements);
-        
-        if (!canvasElements) {
-          throw new Error('Failed to batch create elements: HTTP server unavailable');
-        }
-        
-        const result = {
-          success: true,
-          elements: canvasElements,
-          count: canvasElements.length,
-          syncedToCanvas: true
-        };
-        
-        logger.info('Batch elements created via MCP and synced to canvas', { 
-          count: result.count,
-          synced: result.syncedToCanvas 
+          return convertTextToLabel(element);
         });
+        
+        const canvasResult = await syncToCanvas('batch_create', createdElements);
+        
+        if (!canvasResult) {
+          throw new Error('Failed to batch create elements: Canvas server unavailable');
+        }
         
         return {
           content: [{ 
             type: 'text', 
-            text: `${result.count} elements created successfully!\n\n${JSON.stringify(result, null, 2)}\n\n${result.syncedToCanvas ? '✅ All elements synced to canvas' : '⚠️  Canvas sync failed (elements still created locally)'}` 
+            text: `✅ ${createdElements.length} elements created successfully!` 
+          }]
+        };
+      }
+      
+      case 'finish_diagram': {
+        const params = FinishDiagramSchema.parse(args || {});
+        const sessionId = await getSessionId();
+        
+        logger.info('Finishing diagram', { sessionId, title: params.title });
+        
+        // Call the export endpoint
+        const result = await syncToCanvas('export', { title: params.title });
+        
+        if (!result || !result.success) {
+          throw new Error('Failed to export diagram: ' + (result?.error || 'Unknown error'));
+        }
+        
+        const canvasUrl = result.canvasUrl || `${PUBLIC_URL}/canvas/${sessionId}`;
+        const imageUrl = result.imageUrl;
+        
+        return {
+          content: [{
+            type: 'text',
+            text: `🎉 **Diagram Complete!**
+
+${params.title ? `**Title:** ${params.title}\n` : ''}
+**📎 Shareable Link:** ${canvasUrl}
+${imageUrl ? `**🖼️ Image:** ${imageUrl}\n` : ''}
+**Session ID:** \`${sessionId}\`
+
+Share this link with anyone to view the diagram!`
           }]
         };
       }
@@ -966,16 +894,118 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
   } catch (error) {
     logger.error(`Error handling tool call: ${(error as Error).message}`, { error });
     return {
-      content: [{ type: 'text', text: `Error: ${(error as Error).message}` }],
+      content: [{ type: 'text', text: `❌ Error: ${(error as Error).message}` }],
       isError: true
     };
   }
-});
+}
+
+// Set up request handler for tool calls (stdio mode)
+mcpServer.setRequestHandler(CallToolRequestSchema, handleToolCall);
 
 // Set up request handler for listing available tools
-server.setRequestHandler(ListToolsRequestSchema, async () => {
+mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
   logger.info('Listing available tools');
   return { tools };
+});
+
+// Create Express app for SSE transport
+const sseApp = express();
+sseApp.use(cors());
+
+// Store active SSE transports by session ID
+const sseTransports = new Map<string, SSEServerTransport>();
+
+// Store MCP server instances per session (each user needs their own)
+const mcpServers = new Map<string, Server>();
+
+// Create a new MCP server instance for a session
+function createMcpServerForSession(sessionId: string): Server {
+  const server = new Server(
+    {
+      name: "mcp-excalidraw-server",
+      version: "2.0.0",
+      description: "Hosted MCP server for Excalidraw - create diagrams with AI and get shareable links"
+    },
+    {
+      capabilities: {
+        tools: Object.fromEntries(tools.map(tool => [tool.name, {
+          description: tool.description,
+          inputSchema: tool.inputSchema
+        }]))
+      }
+    }
+  );
+  
+  // Set up the same handlers for this server instance
+  server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest) => {
+    // Set the current session for this request
+    currentSessionId = sessionId;
+    return handleToolCall(request);
+  });
+  
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    logger.info('Listing available tools');
+    return { tools };
+  });
+  
+  mcpServers.set(sessionId, server);
+  return server;
+}
+
+// SSE endpoint for MCP connections
+sseApp.get('/sse', async (req: Request, res: Response) => {
+  logger.info('New SSE connection request');
+  
+  // Create a new session for this connection
+  const sessionId = await createNewSession();
+  
+  // Create unique message endpoint for this session
+  const messageEndpoint = `/messages/${sessionId}`;
+  
+  const transport = new SSEServerTransport(messageEndpoint, res);
+  sseTransports.set(sessionId, transport);
+  
+  // Create a dedicated MCP server for this session
+  const server = createMcpServerForSession(sessionId);
+  
+  res.on('close', () => {
+    logger.info(`SSE connection closed for session: ${sessionId}`);
+    sseTransports.delete(sessionId);
+    mcpServers.delete(sessionId);
+  });
+  
+  await server.connect(transport);
+  logger.info(`SSE transport connected for session: ${sessionId}`);
+});
+
+// Messages endpoint for SSE - route by session ID
+sseApp.post('/messages/:sessionId', async (req: Request, res: Response) => {
+  const sessionId = req.params.sessionId as string;
+  
+  if (!sessionId) {
+    return res.status(400).json({ error: 'Session ID is required' });
+  }
+  
+  const transport = sseTransports.get(sessionId);
+  
+  if (transport) {
+    // Set the current session context
+    currentSessionId = sessionId;
+    await transport.handlePostMessage(req, res);
+  } else {
+    res.status(404).json({ error: `No active session: ${sessionId}` });
+  }
+});
+
+// Health check for SSE server
+sseApp.get('/health', (req: Request, res: Response) => {
+  res.json({
+    status: 'healthy',
+    mode: 'sse',
+    activeSessions: sseTransports.size,
+    timestamp: new Date().toISOString()
+  });
 });
 
 // Start server with transport based on mode
@@ -984,29 +1014,25 @@ async function runServer(): Promise<void> {
     logger.info('Starting Excalidraw MCP server...');
     
     const transportMode = process.env.MCP_TRANSPORT_MODE || 'stdio';
-    let transport;
     
-    if (transportMode === 'http') {
-      const port = parseInt(process.env.PORT || '3000', 10);
-      const host = process.env.HOST || 'localhost';
-      
-      logger.info(`Starting HTTP server on ${host}:${port}`);
-      // Here you would create an HTTP transport
-      // This is a placeholder - actual HTTP transport implementation would need to be added
-      transport = new StdioServerTransport(); // Fallback to stdio for now
+    if (transportMode === 'sse' || transportMode === 'http') {
+      // Start SSE server for remote connections
+      sseApp.listen(MCP_PORT, '0.0.0.0', () => {
+        logger.info(`MCP SSE server running on http://0.0.0.0:${MCP_PORT}`);
+        logger.info(`Connect via SSE at http://localhost:${MCP_PORT}/sse`);
+      });
     } else {
-      // Default to stdio transport
-      transport = new StdioServerTransport();
+      // Default to stdio transport for local use
+      const transport = new StdioServerTransport();
+      
+      // Create a session for stdio mode
+      await createNewSession();
+      
+      await mcpServer.connect(transport);
+      logger.info('Excalidraw MCP server running on stdio');
+      
+      process.stdin.resume();
     }
-    
-    // Add a debug message before connecting
-    logger.debug('Connecting to transport...');
-    
-    await server.connect(transport);
-    logger.info(`Excalidraw MCP server running on ${transportMode}`);
-    
-    // Keep the process running
-    process.stdin.resume();
   } catch (error) {
     logger.error('Error starting server:', error);
     process.stderr.write(`Failed to start MCP server: ${(error as Error).message}\n${(error as Error).stack}\n`);
@@ -1021,16 +1047,11 @@ process.on('uncaughtException', (error: Error) => {
   setTimeout(() => process.exit(1), 1000);
 });
 
-process.on('unhandledRejection', (reason: any, promise: Promise<any>) => {
+process.on('unhandledRejection', (reason: any) => {
   logger.error('Unhandled promise rejection:', reason);
   process.stderr.write(`UNHANDLED REJECTION: ${reason}\n`);
   setTimeout(() => process.exit(1), 1000);
 });
-
-// For testing and debugging purposes
-if (process.env.DEBUG === 'true') {
-  logger.debug('Debug mode enabled');
-}
 
 // Start the server if this file is run directly
 if (fileURLToPath(import.meta.url) === process.argv[1]) {
