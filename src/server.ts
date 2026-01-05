@@ -760,20 +760,24 @@ app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
   });
 });
 
-// ==================== MCP SSE ENDPOINTS ====================
-// These endpoints allow remote AI agents to connect via SSE transport
+// ==================== MCP ENDPOINTS ====================
+// These endpoints allow remote AI agents to connect via Streamable HTTP or SSE transport
 
 import { Server as McpServer } from '@modelcontextprotocol/sdk/server/index.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { handleMcpToolCall, mcpTools, setCurrentSession } from './mcp-handler.js';
+import { randomUUID } from 'crypto';
+import { IncomingMessage, ServerResponse } from 'http';
 
-// Store active SSE transports
+// Store active transports and servers
+const streamableTransports = new Map<string, StreamableHTTPServerTransport>();
 const sseTransports = new Map<string, SSEServerTransport>();
 const mcpServers = new Map<string, McpServer>();
 
-// Create MCP server for a session
-function createMcpServerForSession(sessionId: string): McpServer {
+// Create MCP server instance
+function createMcpServer(): McpServer {
   const mcpServer = new McpServer(
     {
       name: "mcp-excalidraw-server",
@@ -782,16 +786,12 @@ function createMcpServerForSession(sessionId: string): McpServer {
     },
     {
       capabilities: {
-        tools: Object.fromEntries(mcpTools.map(tool => [tool.name, {
-          description: tool.description,
-          inputSchema: tool.inputSchema
-        }]))
+        tools: {}
       }
     }
   );
   
   mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
-    setCurrentSession(sessionId);
     return handleMcpToolCall(request.params.name, request.params.arguments);
   });
   
@@ -799,48 +799,115 @@ function createMcpServerForSession(sessionId: string): McpServer {
     return { tools: mcpTools };
   });
   
-  mcpServers.set(sessionId, mcpServer);
   return mcpServer;
 }
 
-// SSE endpoint for MCP connections
+// ==================== STREAMABLE HTTP TRANSPORT ====================
+// Primary transport for modern MCP clients (POST to /mcp)
+
+const streamableHttpTransport = new StreamableHTTPServerTransport({
+  sessionIdGenerator: () => randomUUID()
+});
+
+const streamableMcpServer = createMcpServer();
+
+// Initialize the streamable transport connection
+(async () => {
+  try {
+    await streamableMcpServer.connect(streamableHttpTransport);
+    logger.info('Streamable HTTP MCP server initialized');
+  } catch (error) {
+    logger.error('Failed to initialize streamable HTTP transport:', error);
+  }
+})();
+
+// Streamable HTTP endpoint - handles both GET and POST
+app.all('/mcp', async (req: Request, res: Response) => {
+  logger.info(`MCP request: ${req.method} /mcp`);
+  
+  try {
+    // Cast to Node.js HTTP types for the SDK
+    await streamableHttpTransport.handleRequest(
+      req as unknown as IncomingMessage,
+      res as unknown as ServerResponse,
+      req.body
+    );
+  } catch (error) {
+    logger.error('Error handling MCP request:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to process MCP request' });
+    }
+  }
+});
+
+// ==================== LEGACY SSE TRANSPORT ====================
+// Fallback for older MCP clients (GET /sse, POST /sse)
+
+// GET /sse - Establish SSE connection
 app.get('/sse', async (req: Request, res: Response) => {
   logger.info('New MCP SSE connection request');
   
-  const session = createSession();
-  const sessionId = session.id;
-  
-  const messageEndpoint = `/messages/${sessionId}`;
-  const transport = new SSEServerTransport(messageEndpoint, res);
-  sseTransports.set(sessionId, transport);
-  
-  const mcpServer = createMcpServerForSession(sessionId);
-  
-  res.on('close', () => {
-    logger.info(`SSE connection closed: ${sessionId}`);
-    sseTransports.delete(sessionId);
-    mcpServers.delete(sessionId);
-  });
-  
-  await mcpServer.connect(transport);
-  logger.info(`MCP SSE connected: ${sessionId}`);
+  try {
+    const sessionId = randomUUID();
+    const session = createSession();
+    
+    // Create transport with unique message endpoint for this session
+    const messageEndpoint = `/sse/message`;
+    const transport = new SSEServerTransport(messageEndpoint, res);
+    
+    // Store with session ID for message routing
+    sseTransports.set(sessionId, transport);
+    (transport as any)._sessionId = sessionId;
+    
+    const mcpServer = createMcpServer();
+    mcpServers.set(sessionId, mcpServer);
+    
+    // Handle connection close
+    res.on('close', () => {
+      logger.info(`SSE connection closed: ${sessionId}`);
+      sseTransports.delete(sessionId);
+      mcpServers.delete(sessionId);
+    });
+    
+    // Connect MCP server to transport
+    await mcpServer.connect(transport);
+    logger.info(`MCP SSE connected: ${sessionId}`);
+  } catch (error) {
+    logger.error('Error setting up SSE connection:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to establish SSE connection' });
+    }
+  }
 });
 
-// Messages endpoint for SSE
-app.post('/messages/:sessionId', async (req: Request, res: Response) => {
-  const sessionId = req.params.sessionId as string;
+// POST /sse/message - Handle SSE messages
+app.post('/sse/message', async (req: Request, res: Response) => {
+  logger.info('MCP SSE message received');
   
-  if (!sessionId) {
-    return res.status(400).json({ error: 'Session ID required' });
+  // Get the most recent transport (simple approach)
+  const transports = Array.from(sseTransports.values());
+  
+  if (transports.length === 0) {
+    return res.status(404).json({ error: 'No active SSE session' });
   }
   
-  const transport = sseTransports.get(sessionId);
+  const transport = transports[transports.length - 1];
+  if (!transport) {
+    return res.status(404).json({ error: 'Transport not found' });
+  }
   
-  if (transport) {
+  const sessionId = (transport as any)._sessionId;
+  if (sessionId) {
     setCurrentSession(sessionId);
+  }
+  
+  try {
     await transport.handlePostMessage(req, res);
-  } else {
-    res.status(404).json({ error: `Session not found: ${sessionId}` });
+  } catch (error) {
+    logger.error('Error handling SSE message:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to process message' });
+    }
   }
 });
 
@@ -848,7 +915,8 @@ app.post('/messages/:sessionId', async (req: Request, res: Response) => {
 app.get('/mcp/health', (req: Request, res: Response) => {
   res.json({
     status: 'healthy',
-    activeSessions: sseTransports.size,
+    streamableSessions: streamableTransports.size,
+    sseSessions: sseTransports.size,
     timestamp: new Date().toISOString()
   });
 });
