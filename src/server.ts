@@ -48,7 +48,16 @@ const wss = new WebSocketServer({ server });
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+
+// Conditional body parsing - skip for SSE endpoints that need raw body
+app.use((req, res, next) => {
+  // SSE message endpoints need raw body access
+  if (req.path === '/sse/message' || req.path.startsWith('/messages/')) {
+    next();
+  } else {
+    express.json()(req, res, next);
+  }
+});
 
 // Serve static files from the build directory
 const staticDir = path.join(__dirname, '../dist');
@@ -117,7 +126,7 @@ wss.on('connection', (ws: WebSocket, req) => {
   ws.on('close', () => {
     const clients = sessionClients.get(sessionId);
     if (clients) {
-      clients.delete(ws);
+    clients.delete(ws);
       if (clients.size === 0) {
         sessionClients.delete(sessionId);
       }
@@ -129,7 +138,7 @@ wss.on('connection', (ws: WebSocket, req) => {
     logger.error('WebSocket error:', error);
     const clients = sessionClients.get(sessionId);
     if (clients) {
-      clients.delete(ws);
+    clients.delete(ws);
     }
   });
 });
@@ -766,8 +775,8 @@ app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
 import { Server as McpServer } from '@modelcontextprotocol/sdk/server/index.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { handleMcpToolCall, mcpTools, setCurrentSession } from './mcp-handler.js';
+import { CallToolRequestSchema, ListToolsRequestSchema, ListPromptsRequestSchema, GetPromptRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { handleMcpToolCall, mcpTools, mcpPrompts, getPromptContent, setCurrentSession } from './mcp-handler.js';
 import { randomUUID } from 'crypto';
 import { IncomingMessage, ServerResponse } from 'http';
 
@@ -786,7 +795,8 @@ function createMcpServer(): McpServer {
     },
     {
       capabilities: {
-        tools: {}
+        tools: {},
+        prompts: {}
       }
     }
   );
@@ -799,70 +809,84 @@ function createMcpServer(): McpServer {
     return { tools: mcpTools };
   });
   
+  // Prompt handlers - these appear as slash commands in Claude Code
+  mcpServer.setRequestHandler(ListPromptsRequestSchema, async () => {
+    return { prompts: mcpPrompts };
+  });
+  
+  mcpServer.setRequestHandler(GetPromptRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    const messages = getPromptContent(name, args || {});
+    return { messages };
+  });
+  
   return mcpServer;
 }
 
-// ==================== STREAMABLE HTTP TRANSPORT ====================
-// Primary transport for modern MCP clients (POST to /mcp)
+// ==================== MCP TRANSPORTS ====================
+// Per MCP spec: Support both Streamable HTTP (modern) and legacy SSE on same endpoint
 
-const streamableHttpTransport = new StreamableHTTPServerTransport({
-  sessionIdGenerator: () => randomUUID()
-});
-
-const streamableMcpServer = createMcpServer();
-
-// Initialize the streamable transport connection
-(async () => {
-  try {
-    await streamableMcpServer.connect(streamableHttpTransport);
-    logger.info('Streamable HTTP MCP server initialized');
-  } catch (error) {
-    logger.error('Failed to initialize streamable HTTP transport:', error);
+// POST /sse - Streamable HTTP transport (modern clients try this first)
+app.post('/sse', async (req: Request, res: Response) => {
+  logger.info('MCP Streamable HTTP request (POST /sse)');
+  
+  // Check for existing session
+  const sessionId = req.headers['mcp-session-id'] as string | undefined;
+  let transport = sessionId ? streamableTransports.get(sessionId) : undefined;
+  
+  if (!transport) {
+    // New session - create transport
+    transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID()
+    });
+    
+    const mcpServer = createMcpServer();
+    
+    // Connect and store
+    await mcpServer.connect(transport);
+    
+    // Store transport after connection (session ID is generated during first request)
+    const newSessionId = transport.sessionId;
+    if (newSessionId) {
+      streamableTransports.set(newSessionId, transport);
+      mcpServers.set(newSessionId, mcpServer);
+      logger.info(`New Streamable HTTP session: ${newSessionId}`);
+    }
   }
-})();
-
-// Streamable HTTP endpoint - handles both GET and POST
-app.all('/mcp', async (req: Request, res: Response) => {
-  logger.info(`MCP request: ${req.method} /mcp`);
   
   try {
-    // Cast to Node.js HTTP types for the SDK
-    await streamableHttpTransport.handleRequest(
+    await transport.handleRequest(
       req as unknown as IncomingMessage,
       res as unknown as ServerResponse,
       req.body
     );
   } catch (error) {
-    logger.error('Error handling MCP request:', error);
+    logger.error('Error handling Streamable HTTP request:', error);
     if (!res.headersSent) {
-      res.status(500).json({ error: 'Failed to process MCP request' });
+      res.status(500).json({ error: 'Failed to process request' });
     }
   }
 });
 
-// ==================== LEGACY SSE TRANSPORT ====================
-// Fallback for older MCP clients (GET /sse, POST /sse)
-
-// GET /sse - Establish SSE connection
+// GET /sse - Legacy SSE transport (fallback for older clients)  
 app.get('/sse', async (req: Request, res: Response) => {
-  logger.info('New MCP SSE connection request');
+  logger.info('MCP Legacy SSE connection request (GET /sse)');
   
   try {
     const sessionId = randomUUID();
-    const session = createSession();
     
-    // Create transport with unique message endpoint for this session
+    // Create transport - message endpoint for client to POST messages
     const messageEndpoint = `/sse/message`;
     const transport = new SSEServerTransport(messageEndpoint, res);
     
-    // Store with session ID for message routing
+    // Store transport
     sseTransports.set(sessionId, transport);
     (transport as any)._sessionId = sessionId;
     
     const mcpServer = createMcpServer();
     mcpServers.set(sessionId, mcpServer);
     
-    // Handle connection close
+    // Cleanup on close
     res.on('close', () => {
       logger.info(`SSE connection closed: ${sessionId}`);
       sseTransports.delete(sessionId);
@@ -871,7 +895,7 @@ app.get('/sse', async (req: Request, res: Response) => {
     
     // Connect MCP server to transport
     await mcpServer.connect(transport);
-    logger.info(`MCP SSE connected: ${sessionId}`);
+    logger.info(`Legacy SSE connected: ${sessionId}`);
   } catch (error) {
     logger.error('Error setting up SSE connection:', error);
     if (!res.headersSent) {
@@ -880,11 +904,11 @@ app.get('/sse', async (req: Request, res: Response) => {
   }
 });
 
-// POST /sse/message - Handle SSE messages
+// POST /sse/message - Handle legacy SSE messages
 app.post('/sse/message', async (req: Request, res: Response) => {
-  logger.info('MCP SSE message received');
+  logger.info('MCP Legacy SSE message received');
   
-  // Get the most recent transport (simple approach)
+  // Get the most recent transport
   const transports = Array.from(sseTransports.values());
   
   if (transports.length === 0) {
@@ -907,6 +931,64 @@ app.post('/sse/message', async (req: Request, res: Response) => {
     logger.error('Error handling SSE message:', error);
     if (!res.headersSent) {
       res.status(500).json({ error: 'Failed to process message' });
+    }
+  }
+});
+
+// DELETE /sse - Handle session termination (Streamable HTTP)
+app.delete('/sse', async (req: Request, res: Response) => {
+  const sessionId = req.headers['mcp-session-id'] as string | undefined;
+  
+  if (sessionId) {
+    const transport = streamableTransports.get(sessionId);
+    if (transport) {
+      await transport.close();
+      streamableTransports.delete(sessionId);
+      mcpServers.delete(sessionId);
+      logger.info(`Session terminated: ${sessionId}`);
+    }
+  }
+  
+  res.status(200).end();
+});
+
+// ==================== /mcp ENDPOINT (Streamable HTTP) ====================
+// Stateless transport - new transport per request, no session tracking
+
+app.all('/mcp', async (req: Request, res: Response) => {
+  logger.info(`MCP Streamable HTTP: ${req.method} /mcp`);
+  
+  try {
+    // Create stateless transport (no session ID generator = stateless mode)
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined // Stateless mode
+    });
+    
+    // Create and connect MCP server for this request
+    const mcpServer = createMcpServer();
+    
+    // Handle the close event
+    transport.onclose = () => {
+      logger.info('Streamable HTTP transport closed');
+    };
+    
+    // Connect server to transport
+    await mcpServer.connect(transport);
+    
+    // Handle the request
+    await transport.handleRequest(
+      req as unknown as IncomingMessage,
+      res as unknown as ServerResponse,
+      req.body
+    );
+  } catch (error) {
+    logger.error('Error handling /mcp request:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ 
+        jsonrpc: '2.0',
+        error: { code: -32603, message: 'Internal error' },
+        id: null
+      });
     }
   }
 });

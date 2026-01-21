@@ -154,6 +154,135 @@ export const mcpTools = [
   }
 ];
 
+// MCP Prompts - Pre-defined templates that appear as slash commands
+export const mcpPrompts = [
+  {
+    name: 'wireframe',
+    description: 'Create a black & white wireframe for a website, app, or a new feature.',
+    arguments: [
+      {
+        name: 'description',
+        description: 'What should the wireframe show? (e.g., "landing page for a SaaS product")',
+        required: true
+      }
+    ]
+  },
+  {
+    name: 'diagram',
+    description: 'Create a diagram (flowchart, architecture, etc.)',
+    arguments: [
+      {
+        name: 'description',
+        description: 'What should the diagram show? (e.g., "user authentication flow")',
+        required: true
+      }
+    ]
+  },
+  {
+    name: 'architecture',
+    description: 'Create a system architecture diagram',
+    arguments: [
+      {
+        name: 'system',
+        description: 'What system to diagram? (e.g., "microservices backend with database")',
+        required: true
+      }
+    ]
+  },
+  {
+    name: 'flowchart',
+    description: 'Create a flowchart showing a process or decision tree',
+    arguments: [
+      {
+        name: 'process',
+        description: 'What process to visualize? (e.g., "user signup and onboarding")',
+        required: true
+      }
+    ]
+  }
+];
+
+// Get the prompt content based on name and arguments
+export function getPromptContent(name: string, args: Record<string, string>): { role: string; content: string }[] {
+  switch (name) {
+    case 'wireframe':
+      return [
+        {
+          role: 'user',
+          content: `Create a wireframe for: ${args.description}
+
+Be creative with the design and layout, super creative.
+
+IMPORTANT INSTRUCTIONS:
+- Use ONLY black and white colors unless the user asks for a specific color.
+- Keep the design minimal and clean unless the user asks for a specific design.
+- Focus on layout and structure
+- Use rectangles for containers, text for labels, and be creative with the design
+- Add placeholder text like "Hero Section", "Navigation", etc. unless the user asks for a specific design.
+
+Start by calling start_diagram, then create the wireframe elements, and finish with finish_diagram.`
+        }
+      ];
+    
+    case 'diagram':
+      return [
+        {
+          role: 'user',
+          content: `Create a diagram for: ${args.description}
+
+INSTRUCTIONS:
+- Don't make it too colorful, keep it minimal and clean unless the user asks for a specific design.
+- Use arrows to show connections and flow
+- Add clear labels to all elements
+- Group related items together
+- Make it professional and easy to understand
+
+Start by calling start_diagram, then create the diagram elements, and finish with finish_diagram.`
+        }
+      ];
+    
+    case 'architecture':
+      return [
+        {
+          role: 'user',
+          content: `Create a system architecture diagram for: ${args.system}
+
+INSTRUCTIONS:
+- Don't make it too colorful, keep it minimal and clean unless the user asks for a specific design.
+- Use arrows to show data flow and connections
+- Add clear labels for each component
+- Show the relationships between components
+
+Start by calling start_diagram, then create the architecture elements, and finish with finish_diagram.`
+        }
+      ];
+    
+    case 'flowchart':
+      return [
+        {
+          role: 'user',
+          content: `Create a flowchart for: ${args.process}
+
+INSTRUCTIONS:
+- Use arrows to connect steps and show flow
+- Don't make it too colorful, keep it minimal and clean unless the user asks for a specific design.
+- Add clear labels for each step
+- Keep the flow logical and easy to follow
+
+Start by calling start_diagram, then create the flowchart elements, and finish with finish_diagram.`
+        }
+      ];
+    
+    default:
+      return [
+        {
+          role: 'user',
+          content: `Create a diagram using the Excalidraw tools. Start with start_diagram, add elements, and finish with finish_diagram.`
+        }
+      ];
+  }
+}
+
 // Internal API calls to the canvas server (same process)
 async function callInternalApi(method: string, path: string, body?: any): Promise<any> {
   const baseUrl = 'http://localhost:' + (process.env.PORT || '3000');
