@@ -10,7 +10,7 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install all dependencies (including dev dependencies for build)
-RUN npm ci && npm cache clean --force
+RUN npm install && npm cache clean --force
 
 # Copy frontend source
 COPY frontend ./frontend
@@ -28,7 +28,7 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install all dependencies (including TypeScript compiler)
-RUN npm ci && npm cache clean --force
+RUN npm install && npm cache clean --force
 
 # Copy backend source
 COPY src ./src
@@ -74,7 +74,7 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install only production dependencies
-RUN npm ci --only=production && npm cache clean --force
+RUN npm install --only=production && npm cache clean --force
 
 # Copy compiled backend from builder stage
 COPY --from=backend-builder /app/dist ./dist
@@ -103,6 +103,6 @@ EXPOSE 3000
 CMD ["node", "dist/server.js"]
 
 # Labels for metadata
-LABEL org.opencontainers.image.source="https://github.com/yctimlin/mcp_excalidraw"
+LABEL org.opencontainers.image.source="https://github.com/0xArtex/excalidraw-mcp"
 LABEL org.opencontainers.image.description="MCP Excalidraw Hosted Canvas Server - Web UI, REST API, and Image Export"
 LABEL org.opencontainers.image.licenses="MIT"

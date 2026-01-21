@@ -10,7 +10,7 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install all dependencies (including TypeScript compiler)
-RUN npm ci && npm cache clean --force
+RUN npm install && npm cache clean --force
 
 # Copy backend source
 COPY src ./src
@@ -57,6 +57,6 @@ EXPOSE 3001
 CMD ["node", "dist/index.js"]
 
 # Labels for metadata
-LABEL org.opencontainers.image.source="https://github.com/yctimlin/mcp_excalidraw"
+LABEL org.opencontainers.image.source="https://github.com/0xArtex/excalidraw-mcp"
 LABEL org.opencontainers.image.description="MCP Excalidraw Server - Hosted SSE mode for remote AI agents"
 LABEL org.opencontainers.image.licenses="MIT"
