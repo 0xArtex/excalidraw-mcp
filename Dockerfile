@@ -6,8 +6,8 @@ FROM node:18-slim AS builder
 
 WORKDIR /app
 
-# Copy package files
-COPY package*.json ./
+# Copy package.json only (not package-lock.json to avoid platform issues)
+COPY package.json ./
 
 # Install all dependencies (including TypeScript compiler)
 RUN npm install && npm cache clean --force
@@ -28,11 +28,11 @@ RUN addgroup --system --gid 1001 nodejs && \
 
 WORKDIR /app
 
-# Copy package files
-COPY package*.json ./
+# Copy package.json only (not package-lock.json to avoid platform issues)
+COPY package.json ./
 
 # Install only production dependencies
-RUN npm ci --only=production && npm cache clean --force
+RUN npm install --only=production && npm cache clean --force
 
 # Copy compiled backend (MCP server only)
 COPY --from=builder /app/dist ./dist
