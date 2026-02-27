@@ -28,9 +28,9 @@ export function getCurrentSession(): string | null {
 
 // Get public URL from environment
 function getPublicUrl(): string {
-  return process.env.PUBLIC_URL || process.env.RAILWAY_PUBLIC_DOMAIN 
+  return process.env.PUBLIC_URL || (process.env.RAILWAY_PUBLIC_DOMAIN
     ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
-    : 'http://localhost:3000';
+    : 'http://localhost:3000');
 }
 
 // Schema definitions
