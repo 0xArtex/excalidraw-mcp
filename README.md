@@ -1,93 +1,53 @@
-# Excalidraw MCP Server
+# Excalidraw MCP Server & Agent Skill
 
-A hosted MCP server that enables AI assistants to create diagrams on a live Excalidraw canvas and generate shareable links.
+Let your AI agent run a live Excalidraw canvas and draw diagrams. This repo provides:
 
-> Built on top of [mcp_excalidraw](https://github.com/yctimlin/mcp_excalidraw) by [@yctimlin](https://github.com/yctimlin). Added shareable links, image export, session management, and Streamable HTTP transport.
+- **MCP Server**: Connect via Model Context Protocol (Claude Desktop, Cursor, Claude Code, etc.)
+- **Agent Skill**: Portable skill for OpenClaw agents and other skill-enabled agents
 
-## Features
+> Built on top of [mcp_excalidraw](https://github.com/yctimlin/mcp_excalidraw) by [@yctimlin](https://github.com/yctimlin). Added shareable links, image export, agent skill, and a hosted API.
 
-- **Live Canvas**: Real-time Excalidraw canvas accessible via web browser
-- **AI Integration**: MCP server allows AI agents (Claude, etc.) to create visual diagrams
-- **Shareable Links**: Generate shareable URLs for your diagrams
-- **Image Export**: Automatically export diagrams as images
-- **Prompt Templates**: Built-in prompts for wireframes, flowcharts, architecture diagrams
+## Demo
 
-## Quick Start
+![MCP Wireframe Demo](assets/demo-wireframe.png)
+*AI agent creates a wireframe via MCP tools*
 
-### 1. Install & Run
+![Agent Skill Demo](assets/demo-telegram.jpg)
+*OpenClaw agent renders a diagram and sends it to Telegram with an edit link*
+
+## Hosted Instance
+
+A public instance is running at `https://excalidraw-mcp.up.railway.app` — no setup needed.
+
+```json
+{
+  "mcpServers": {
+    "excalidraw": {
+      "url": "https://excalidraw-mcp.up.railway.app/mcp"
+    }
+  }
+}
+```
+
+## Self-Hosting
+
+### Local
 
 ```bash
-git clone git@github.com:0xArtex/excalidraw-mcp.git
+git clone https://github.com/0xArtex/excalidraw-mcp.git
+cd excalidraw-mcp
 npm install
 npm run build
 npm run canvas
 ```
 
-The server will start at `http://localhost:3000`
+Server starts at `http://localhost:3000`.
 
-### 2. Connect Your AI Assistant
+### Docker
 
-Add to your MCP client configuration:
-
-**Claude Desktop** (`claude_desktop_config.json`):
-```json
-{
-  "mcpServers": {
-    "excalidraw": {
-      "url": "http://localhost:3000/mcp"
-    }
-  }
-}
-```
-
-**Claude Code** (`.mcp.json` in project root):
-```json
-{
-  "mcpServers": {
-    "excalidraw": {
-      "url": "http://localhost:3000/mcp"
-    }
-  }
-}
-```
-
-**Cursor** (`.cursor/mcp.json`):
-```json
-{
-  "mcpServers": {
-    "excalidraw": {
-      "url": "http://localhost:3000/mcp"
-    }
-  }
-}
-```
-
-### 3. Start Creating
-
-Once connected, your AI assistant can use commands like:
-- `/wireframe` - Create a wireframe for a website or app
-- `/diagram` - Create a flowchart or diagram
-- `/architecture` - Create a system architecture diagram
-- `/flowchart` - Create a process flowchart
-
-Or just ask naturally: "Create a diagram showing the user authentication flow"
-
-### Canvas Example
-
-![Excalidraw MCP Canvas](https://i.ibb.co/SW5VHs8/G-ZQFL4bw-AAP5-Ra.png)
-
-## Hosted Deployment
-
-Deploy to any cloud platform (Railway, Render, Fly.io, etc.) and connect remotely:
-
-```json
-{
-  "mcpServers": {
-    "excalidraw": {
-      "url": "https://your-deployment-url.com/mcp"
-    }
-  }
-}
+```bash
+docker build -f Dockerfile.canvas -t excalidraw-mcp .
+docker run -p 3000:3000 -e PUBLIC_URL=https://your-domain.com excalidraw-mcp
 ```
 
 ### Environment Variables
@@ -95,7 +55,73 @@ Deploy to any cloud platform (Railway, Render, Fly.io, etc.) and connect remotel
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `3000` | Server port |
-| `PUBLIC_URL` | auto-detected | Public URL for shareable links |
+| `PUBLIC_URL` | auto-detected | Public URL for edit links |
+| `CANVAS_BASE_URL` | `http://localhost:3000` | Internal URL for renderer (auto-resolved) |
+| `RATE_LIMIT_RPM` | `10` | Rate limit per IP per minute |
+| `MAX_ELEMENTS` | `2000` | Max elements per render request |
+| `RENDER_TIMEOUT_MS` | `300000` | Render timeout (5 min) |
+
+## Configure MCP Clients
+
+The MCP server can be connected via Streamable HTTP (hosted) or stdio (local).
+
+### Claude Desktop
+
+**Hosted:**
+```json
+{
+  "mcpServers": {
+    "excalidraw": {
+      "url": "https://excalidraw-mcp.up.railway.app/mcp"
+    }
+  }
+}
+```
+
+**Local (node):**
+```json
+{
+  "mcpServers": {
+    "excalidraw": {
+      "command": "node",
+      "args": ["/path/to/excalidraw-mcp/dist/index.js"],
+      "env": {
+        "EXPRESS_SERVER_URL": "http://localhost:3000"
+      }
+    }
+  }
+}
+```
+
+### Claude Code
+
+```bash
+claude mcp add excalidraw --scope user \
+  -e EXPRESS_SERVER_URL=http://localhost:3000 \
+  -- node /path/to/excalidraw-mcp/dist/index.js
+```
+
+### Cursor
+
+Config location: `.cursor/mcp.json`
+
+```json
+{
+  "mcpServers": {
+    "excalidraw": {
+      "url": "https://excalidraw-mcp.up.railway.app/mcp"
+    }
+  }
+}
+```
+
+## Agent Skill
+
+For OpenClaw and other skill-enabled agents, install the skill to render diagrams with a single API call — no MCP client needed.
+
+The skill is available at [`skills/excalidraw-canvas/`](skills/excalidraw-canvas/) or can be installed from [ClawhHub](https://clawhub.ai/0xArtex/excalidraw-canvas).
+
+See [`SKILL.md`](skills/excalidraw-canvas/SKILL.md) for usage — it's a single `curl` call.
 
 ## MCP Tools
 
@@ -107,41 +133,12 @@ Deploy to any cloud platform (Railway, Render, Fly.io, etc.) and connect remotel
 | `delete_element` | Remove an element |
 | `finish_diagram` | Finalize and get shareable link with image |
 
-## API Endpoints
-
-| Endpoint | Description |
-|----------|-------------|
-| `POST /mcp` | MCP Streamable HTTP transport |
-| `GET /canvas/:sessionId` | View diagram canvas |
-| `GET /health` | Health check |
-
 ## Development
 
 ```bash
-# Development mode (watch + hot reload)
-npm run dev
-
-# Build
-npm run build
-
-# Type check
-npm run type-check
-```
-
-## Project Structure
-
-```
-excalidraw-mcp/
-├── src/
-│   ├── server.ts        # Express server + MCP endpoints
-│   ├── mcp-handler.ts   # MCP tool implementations
-│   ├── sessions.ts      # Session management
-│   ├── imageExport.ts   # Puppeteer image export
-│   └── types.ts         # TypeScript definitions
-├── frontend/
-│   └── src/
-│       └── App.tsx      # React Excalidraw canvas
-└── dist/                # Compiled output
+npm run dev        # Watch + hot reload
+npm run build      # Build everything
+npm run type-check # TypeScript check
 ```
 
 ## License
