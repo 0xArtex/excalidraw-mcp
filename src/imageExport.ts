@@ -1,5 +1,7 @@
 import puppeteer from 'puppeteer-core';
 import type { Browser } from 'puppeteer-core';
+import { execSync } from 'child_process';
+import { existsSync } from 'fs';
 import logger from './utils/logger.js';
 import fs from 'fs/promises';
 import path from 'path';
@@ -7,6 +9,30 @@ import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Find Chrome binary in common locations
+function findChrome(): string {
+  const candidates = [
+    // Debian/Ubuntu system Chromium (container-patched, preferred in Docker)
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    // Google Chrome system installations
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/google-chrome',
+    // Puppeteer cache (local dev)
+    ...(() => {
+      try {
+        const home = process.env.HOME || '/root';
+        const glob = execSync(`ls ${home}/.cache/puppeteer/chrome/*/chrome-linux64/chrome 2>/dev/null`, { encoding: 'utf8' }).trim().split('\n');
+        return glob.filter(Boolean);
+      } catch { return []; }
+    })(),
+  ];
+  for (const c of candidates) {
+    if (c && existsSync(c)) return c;
+  }
+  throw new Error('Chrome/Chromium not found. Set PUPPETEER_EXECUTABLE_PATH env var.');
+}
 
 // Directory to store exported images
 const EXPORTS_DIR = process.env.EXPORTS_DIR || path.join(__dirname, '../exports');
@@ -41,14 +67,11 @@ async function getBrowser(): Promise<Browser> {
     };
     
     // Resolve Chrome/Chromium executable path
-    // Docker: PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-    // Local: tries common paths
     const execPath = process.env.PUPPETEER_EXECUTABLE_PATH 
       || process.env.CHROME_PATH
-      || '/usr/bin/chromium'
-      || '/usr/bin/chromium-browser'
-      || '/usr/bin/google-chrome';
+      || findChrome();
     launchOptions.executablePath = execPath;
+    logger.info(`Using Chrome at: ${execPath}`);
     
     browser = await puppeteer.launch(launchOptions);
     logger.info('Puppeteer browser launched');
