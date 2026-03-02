@@ -37,11 +37,66 @@ function findChrome(): string {
 // Directory to store exported images
 const EXPORTS_DIR = process.env.EXPORTS_DIR || path.join(__dirname, '../exports');
 
-// Base URL for the canvas server
+// Base URL for the canvas server (internal, for Puppeteer to navigate)
 const CANVAS_BASE_URL = process.env.CANVAS_BASE_URL || 'http://localhost:3000';
 
-// Public URL for serving images (TO-DO: change to CDN URL in production)
+// Public URL for serving images and edit links
 const PUBLIC_URL = process.env.PUBLIC_URL || CANVAS_BASE_URL;
+
+// Resolved internal URL for Puppeteer (determined at first render)
+let resolvedCanvasBaseUrl: string | null = null;
+
+// Check if a URL is reachable
+async function isReachable(url: string, timeoutMs = 3000): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Resolve the best internal URL for Puppeteer to reach our server
+async function getCanvasBaseUrl(): Promise<string> {
+  if (resolvedCanvasBaseUrl) return resolvedCanvasBaseUrl;
+
+  // Try CANVAS_BASE_URL first (usually localhost)
+  if (await isReachable(`${CANVAS_BASE_URL}/health`)) {
+    resolvedCanvasBaseUrl = CANVAS_BASE_URL;
+    logger.info(`Canvas base URL resolved: ${resolvedCanvasBaseUrl}`);
+    return resolvedCanvasBaseUrl;
+  }
+
+  // Try common localhost variants
+  const port = process.env.PORT || '3000';
+  const candidates = [
+    `http://127.0.0.1:${port}`,
+    `http://0.0.0.0:${port}`,
+    `http://localhost:${port}`,
+  ];
+  for (const candidate of candidates) {
+    if (candidate !== CANVAS_BASE_URL && await isReachable(`${candidate}/health`)) {
+      resolvedCanvasBaseUrl = candidate;
+      logger.info(`Canvas base URL resolved (fallback): ${resolvedCanvasBaseUrl}`);
+      return resolvedCanvasBaseUrl;
+    }
+  }
+
+  // Last resort: use PUBLIC_URL (works in Railway where localhost may not)
+  if (PUBLIC_URL !== CANVAS_BASE_URL) {
+    resolvedCanvasBaseUrl = PUBLIC_URL;
+    logger.info(`Canvas base URL resolved (public fallback): ${resolvedCanvasBaseUrl}`);
+    return resolvedCanvasBaseUrl;
+  }
+
+  // Give up, use default
+  resolvedCanvasBaseUrl = CANVAS_BASE_URL;
+  logger.warn(`Canvas base URL unresolved, using default: ${resolvedCanvasBaseUrl}`);
+  return resolvedCanvasBaseUrl;
+}
 
 let browser: Browser | null = null;
 
@@ -108,7 +163,8 @@ export async function exportSessionToImage(sessionId: string): Promise<{
       deviceScaleFactor: 2 // For higher quality
     });
     
-    const canvasUrl = `${CANVAS_BASE_URL}/canvas/${sessionId}`;
+    const baseUrl = await getCanvasBaseUrl();
+    const canvasUrl = `${baseUrl}/canvas/${sessionId}`;
     logger.info(`Navigating to canvas: ${canvasUrl}`);
     
     await page.goto(canvasUrl, {
