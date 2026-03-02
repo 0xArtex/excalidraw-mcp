@@ -1,4 +1,5 @@
-import puppeteer, { Browser } from 'puppeteer';
+import puppeteer from 'puppeteer-core';
+import type { Browser } from 'puppeteer-core';
 import logger from './utils/logger.js';
 import fs from 'fs/promises';
 import path from 'path';
@@ -31,14 +32,23 @@ async function getBrowser(): Promise<Browser> {
         '--disable-dev-shm-usage',
         '--disable-gpu',
         '--disable-software-rasterizer',
-        '--disable-crashpad'
+        '--disable-crashpad',
+        '--no-default-browser-check',
+        '--no-first-run',
+        '--disable-extensions',
+        '--disable-default-apps'
       ]
     };
     
-    // Use custom Chrome path if provided (for Docker)
-    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-      launchOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-    }
+    // Resolve Chrome/Chromium executable path
+    // Docker: PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+    // Local: tries common paths
+    const execPath = process.env.PUPPETEER_EXECUTABLE_PATH 
+      || process.env.CHROME_PATH
+      || '/usr/bin/chromium'
+      || '/usr/bin/chromium-browser'
+      || '/usr/bin/google-chrome';
+    launchOptions.executablePath = execPath;
     
     browser = await puppeteer.launch(launchOptions);
     logger.info('Puppeteer browser launched');

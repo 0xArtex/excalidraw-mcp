@@ -73,8 +73,9 @@ WORKDIR /app
 # Copy package.json only (not package-lock.json to avoid platform issues)
 COPY package.json ./
 
-# Install only production dependencies
-RUN npm install --only=production && npm cache clean --force
+# Install only production dependencies (skip bundled Chromium download)
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+RUN npm install --omit=dev --legacy-peer-deps && npm cache clean --force
 
 # Copy compiled backend from builder stage
 COPY --from=backend-builder /app/dist ./dist
