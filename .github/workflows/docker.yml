@@ -11,8 +11,8 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME_MCP: ${{ github.repository }}
-  IMAGE_NAME_CANVAS: ${{ github.repository }}-canvas
+  IMAGE_NAME_MCP: 0xartex/excalidraw-mcp
+  IMAGE_NAME_CANVAS: 0xartex/excalidraw-mcp-canvas
 
 jobs:
   build-and-push-mcp:

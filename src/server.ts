@@ -644,6 +644,94 @@ app.post('/api/sessions/:sessionId/export', async (req: Request, res: Response) 
   }
 });
 
+// ==================== STATELESS RENDER API ====================
+
+// POST /api/render - Stateless rendering: takes elements, returns PNG + edit URL
+// Nothing is stored. Elements exist only for the duration of the request.
+app.post('/api/render', async (req: Request, res: Response) => {
+  try {
+    const { elements: inputElements, background, theme } = req.body;
+
+    if (!inputElements || !Array.isArray(inputElements) || inputElements.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'elements array is required and must not be empty'
+      });
+    }
+
+    // Create a temporary session
+    const tempSessionId = `render-${generateId()}`;
+    const session = getOrCreateSession(tempSessionId);
+
+    // Add all elements to the session
+    for (const el of inputElements) {
+      const id = el.id || generateId();
+      const element: ServerElement = {
+        ...el,
+        id,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        version: 1
+      };
+      session.elements.set(id, element);
+    }
+
+    // Export to image
+    const result = await exportSessionToImage(tempSessionId);
+
+    // Generate excalidraw.com edit URL
+    const baseUrl = process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`;
+    const editUrl = `${baseUrl}/canvas/${tempSessionId}`;
+
+    // Keep session alive for 30 min for editing, then auto-cleanup handles it
+    // (Don't delete immediately — the edit URL needs it)
+
+    // Also delete the exported image file after reading it
+    let imageBuffer: Buffer | null = null;
+    if (result.success && result.imagePath) {
+      try {
+        const fs = await import('fs/promises');
+        imageBuffer = await fs.readFile(result.imagePath);
+        await fs.unlink(result.imagePath).catch(() => {});
+      } catch (e) {
+        // Image read failed
+      }
+    }
+
+    if (!result.success || !imageBuffer) {
+      return res.status(500).json({
+        success: false,
+        error: result.error || 'Failed to render image'
+      });
+    }
+
+    // Check if client wants JSON response with base64 image
+    const wantsJson = req.headers.accept?.includes('application/json') || req.query.format === 'json';
+
+    if (wantsJson) {
+      return res.json({
+        success: true,
+        png: imageBuffer.toString('base64'),
+        editUrl,
+        elements: inputElements.length
+      });
+    }
+
+    // Default: return PNG directly with edit URL in header
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('X-Edit-Url', editUrl);
+    res.setHeader('Content-Disposition', 'inline; filename="diagram.png"');
+    res.send(imageBuffer);
+
+  } catch (error) {
+    logger.error('Error in stateless render:', error);
+    res.status(500).json({
+      success: false,
+      error: (error as Error).message
+    });
+  }
+});
+
 // ==================== LEGACY ROUTES (for backward compatibility) ====================
 
 // Default session for legacy API calls
@@ -706,6 +794,17 @@ app.post('/api/elements', (req: Request, res: Response) => {
 });
 
 // ==================== CANVAS ROUTES ====================
+
+// Serve the frontend for stateless view (elements in URL hash)
+app.get('/canvas/view', (req: Request, res: Response) => {
+  const htmlFile = path.join(__dirname, '../dist/frontend/index.html');
+  res.sendFile(htmlFile, (err) => {
+    if (err) {
+      logger.error('Error serving frontend:', err);
+      res.status(404).send('Frontend not found. Please run "npm run build" first.');
+    }
+  });
+});
 
 // Serve the frontend for session-based canvas
 app.get('/canvas/:sessionId', (req: Request, res: Response) => {
