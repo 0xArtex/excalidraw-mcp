@@ -40,10 +40,12 @@ RUN npm run build:server
 # Stage 3: Production Canvas Server with Puppeteer
 FROM node:18-slim AS production
 
-# Install Chromium dependencies for Puppeteer
+# Install Chromium and dependencies
+# Use Debian's chromium with workarounds for container compatibility
 RUN apt-get update && apt-get install -y \
     chromium \
     fonts-liberation \
+    fonts-noto-color-emoji \
     libasound2 \
     libatk-bridge2.0-0 \
     libatk1.0-0 \
@@ -62,7 +64,10 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 \
     xdg-utils \
     --no-install-recommends \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # Create a wrapper script that launches chromium with container-safe flags
+    && printf '#!/bin/bash\nexec /usr/bin/chromium --no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu --disable-software-rasterizer --disable-crashpad "$@"\n' > /usr/local/bin/chromium-container \
+    && chmod +x /usr/local/bin/chromium-container
 
 # Create non-root user for security
 RUN addgroup --system --gid 1001 nodejs && \
@@ -94,7 +99,7 @@ ENV NODE_ENV=production
 ENV PORT=3000
 ENV HOST=0.0.0.0
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/local/bin/chromium-container
 ENV EXPORTS_DIR=/app/exports
 
 # Expose port
