@@ -76,6 +76,26 @@ function getSessionIdFromUrl(): string | null {
   return null;
 }
 
+// Check if this is a stateless view (elements encoded in URL hash)
+function getElementsFromHash(): ServerElement[] | null {
+  const hash = window.location.hash;
+  if (!hash || !hash.startsWith('#elements=')) return null;
+  try {
+    const encoded = hash.slice('#elements='.length);
+    const json = decodeURIComponent(atob(encoded));
+    const elements = JSON.parse(json);
+    if (Array.isArray(elements)) return elements;
+    return null;
+  } catch (e) {
+    console.error('Failed to decode elements from URL hash:', e);
+    return null;
+  }
+}
+
+function isStatelessView(): boolean {
+  return getElementsFromHash() !== null;
+}
+
 // Helper function to clean elements for Excalidraw
 const cleanElementForExcalidraw = (element: ServerElement): Partial<ExcalidrawElement> => {
   const {
@@ -136,6 +156,10 @@ function App(): JSX.Element {
   const sessionId = useMemo(() => getSessionIdFromUrl(), []);
   const [sessionCreatedAt, setSessionCreatedAt] = useState<string | null>(null);
   
+  // Stateless mode (elements in URL hash)
+  const hashElements = useMemo(() => getElementsFromHash(), []);
+  const statelessMode = hashElements !== null;
+  
   // Sync state management
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('idle')
   const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null)
@@ -148,8 +172,9 @@ function App(): JSX.Element {
     return `/api${path}`;
   };
 
-  // WebSocket connection
+  // WebSocket connection (skip in stateless mode)
   useEffect(() => {
+    if (statelessMode) return;
     connectWebSocket()
     return () => {
       if (websocketRef.current) {
@@ -161,10 +186,22 @@ function App(): JSX.Element {
   // Load existing elements when Excalidraw API becomes available
   useEffect(() => {
     if (excalidrawAPI) {
-      loadExistingElements()
-      
-      if (!isConnected) {
-        connectWebSocket()
+      if (statelessMode && hashElements) {
+        // Stateless mode: load elements from URL hash, no server connection
+        const cleanedElements = hashElements.map(cleanElementForExcalidraw)
+        const validatedElements = validateAndFixBindings(cleanedElements)
+        const convertedElements = convertToExcalidrawElements(validatedElements, { regenerateIds: false })
+        excalidrawAPI.updateScene({
+          elements: convertedElements,
+          captureUpdate: CaptureUpdateAction.NEVER
+        })
+        // Zoom to fit after a short delay
+        setTimeout(() => excalidrawAPI.scrollToContent(undefined, { fitToContent: true }), 200)
+      } else {
+        loadExistingElements()
+        if (!isConnected) {
+          connectWebSocket()
+        }
       }
     }
   }, [excalidrawAPI, isConnected])
