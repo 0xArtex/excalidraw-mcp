@@ -49,6 +49,50 @@ const wss = new WebSocketServer({ server });
 // Middleware
 app.use(cors());
 
+// Rate limiting by IP (configurable via RATE_LIMIT_RPM env, default 10 req/min)
+const RATE_LIMIT_RPM = parseInt(process.env.RATE_LIMIT_RPM || '10', 10);
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+
+// Cleanup stale entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of rateLimitMap) {
+    if (now > val.resetAt) rateLimitMap.delete(key);
+  }
+}, 5 * 60_000);
+
+function getRateLimitKey(req: Request): string {
+  return req.headers['x-forwarded-for']?.toString().split(',')[0]?.trim() || req.ip || 'unknown';
+}
+
+// Apply rate limit only to /api/render
+app.use('/api/render', (req: Request, res: Response, next: NextFunction) => {
+  const key = getRateLimitKey(req);
+  const now = Date.now();
+  let entry = rateLimitMap.get(key);
+
+  if (!entry || now > entry.resetAt) {
+    entry = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+    rateLimitMap.set(key, entry);
+  }
+
+  entry.count++;
+  const remaining = Math.max(0, RATE_LIMIT_RPM - entry.count);
+  res.set('X-RateLimit-Limit', String(RATE_LIMIT_RPM));
+  res.set('X-RateLimit-Remaining', String(remaining));
+  res.set('X-RateLimit-Reset', String(Math.ceil(entry.resetAt / 1000)));
+
+  if (entry.count > RATE_LIMIT_RPM) {
+    res.status(429).json({ error: 'Rate limit exceeded', retryAfterMs: entry.resetAt - now });
+    return;
+  }
+  next();
+});
+
+// Body size limit (5MB)
+app.use(express.json({ limit: '5mb' }));
+
 // Conditional body parsing - skip for SSE endpoints that need raw body
 app.use((req, res, next) => {
   // SSE message endpoints need raw body access
@@ -659,6 +703,14 @@ app.post('/api/render', async (req: Request, res: Response) => {
       });
     }
 
+    const MAX_ELEMENTS = parseInt(process.env.MAX_ELEMENTS || '2000', 10);
+    if (inputElements.length > MAX_ELEMENTS) {
+      return res.status(400).json({
+        success: false,
+        error: `Too many elements (${inputElements.length}). Maximum is ${MAX_ELEMENTS}.`
+      });
+    }
+
     // Create a temporary session
     const tempSessionId = `render-${generateId()}`;
     const session = getOrCreateSession(tempSessionId);
@@ -676,8 +728,14 @@ app.post('/api/render', async (req: Request, res: Response) => {
       session.elements.set(id, element);
     }
 
-    // Export to image
-    const result = await exportSessionToImage(tempSessionId);
+    // Export to image (with 5 min timeout)
+    const RENDER_TIMEOUT_MS = parseInt(process.env.RENDER_TIMEOUT_MS || '300000', 10);
+    const result = await Promise.race([
+      exportSessionToImage(tempSessionId),
+      new Promise<{ success: false; error: string }>((_, resolve) =>
+        setTimeout(() => resolve({ success: false, error: 'Render timed out' }), RENDER_TIMEOUT_MS)
+      )
+    ]) as Awaited<ReturnType<typeof exportSessionToImage>>;
 
     // Generate excalidraw.com edit URL
     const baseUrl = process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`;
