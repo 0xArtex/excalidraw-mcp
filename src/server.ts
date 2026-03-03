@@ -207,7 +207,12 @@ const CreateElementSchema = z.object({
   fontSize: z.number().optional(),
   fontFamily: z.string().optional(),
   groupIds: z.array(z.string()).optional(),
-  locked: z.boolean().optional()
+  locked: z.boolean().optional(),
+  points: z.array(z.array(z.number())).optional(),
+  startArrowhead: z.string().nullable().optional(),
+  endArrowhead: z.string().nullable().optional(),
+  startBinding: z.any().optional(),
+  endBinding: z.any().optional(),
 });
 
 const UpdateElementSchema = z.object({
@@ -348,9 +353,25 @@ app.post('/api/sessions/:sessionId/elements', (req: Request, res: Response) => {
     logger.info('Creating element via API', { sessionId, type: params.type });
 
     const id = params.id || generateId();
+    
+    // Auto-calculate width/height from points for arrows/lines/freedraw
+    const extra: any = {};
+    if (params.points && ['arrow', 'line', 'freedraw'].includes(params.type)) {
+      const xs = params.points.map((p) => p[0] ?? 0);
+      const ys = params.points.map((p) => p[1] ?? 0);
+      if (!(params as any).width) extra.width = Math.max(...xs) - Math.min(...xs);
+      if (!(params as any).height) extra.height = Math.max(...ys) - Math.min(...ys);
+      if (params.type === 'freedraw') {
+        extra.simulatePressure = true;
+        extra.pressures = [];
+        extra.lastCommittedPoint = params.points[params.points.length - 1];
+      }
+    }
+    
     const element: ServerElement = {
       id,
       ...params,
+      ...extra,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       version: 1
@@ -715,17 +736,136 @@ app.post('/api/render', async (req: Request, res: Response) => {
     const tempSessionId = `render-${generateId()}`;
     const session = getOrCreateSession(tempSessionId);
 
-    // Add all elements to the session
+    // Normalize simplified element format to full Excalidraw format
+    const normalizedElements: any[] = [];
     for (const el of inputElements) {
       const id = el.id || generateId();
-      const element: ServerElement = {
+      
+      // Map shorthand props to Excalidraw props
+      const normalized: any = {
         ...el,
         id,
+        version: el.version || 1,
+        versionNonce: el.versionNonce || Math.floor(Math.random() * 1000000),
+        isDeleted: false,
+        groupIds: el.groupIds || [],
+        frameId: el.frameId || null,
+        roundness: el.roundness ?? (['rectangle', 'diamond', 'ellipse'].includes(el.type) ? { type: 3 } : null),
+        boundElements: el.boundElements || null,
+        updated: el.updated || Date.now(),
+        link: el.link || null,
+        locked: el.locked || false,
+        strokeColor: el.stroke || el.strokeColor || '#1e1e1e',
+        backgroundColor: el.bg || el.backgroundColor || 'transparent',
+        fillStyle: (el.bg || el.backgroundColor) ? (el.fillStyle || 'solid') : (el.fillStyle || 'solid'),
+        strokeWidth: el.strokeWidth || 2,
+        roughness: el.roughness ?? 1,
+        opacity: el.opacity || 100,
+        angle: el.angle || 0,
+        seed: el.seed || Math.floor(Math.random() * 1000000),
+      };
+
+      // Remove shorthand props
+      delete normalized.bg;
+      delete normalized.stroke;
+      delete normalized.label;
+
+      // Set type-specific defaults
+      if (['arrow', 'line', 'freedraw'].includes(el.type)) {
+        normalized.points = el.points || [[0, 0]];
+        if (el.type === 'arrow') {
+          normalized.startBinding = el.startBinding || null;
+          normalized.endBinding = el.endBinding || null;
+          normalized.startArrowhead = el.startArrowhead || null;
+          normalized.endArrowhead = el.endArrowhead || 'arrow';
+        }
+        if (el.type === 'freedraw') {
+          normalized.simulatePressure = el.simulatePressure ?? true;
+          normalized.pressures = el.pressures || [];
+          const pts = normalized.points;
+          if (pts.length > 0) {
+            normalized.lastCommittedPoint = pts[pts.length - 1];
+          }
+        }
+      }
+
+      if (el.type === 'text') {
+        normalized.fontSize = el.fontSize || 20;
+        normalized.fontFamily = el.fontFamily || 1;
+        normalized.textAlign = el.textAlign || 'left';
+        normalized.verticalAlign = el.verticalAlign || 'top';
+        normalized.text = el.text || '';
+        normalized.rawText = el.text || '';
+      }
+
+      normalizedElements.push(normalized);
+
+      // Handle label: create a text element visually centered in the shape
+      // We use containerId binding AND calculate accurate initial coordinates
+      // so text appears centered even before Excalidraw recalculates
+      if (el.label && ['rectangle', 'ellipse', 'diamond'].includes(el.type)) {
+        const labelText = typeof el.label === 'string' ? el.label : el.label?.text || '';
+        if (labelText) {
+          const labelId = generateId();
+          const fontSize = el.fontSize || 16;
+          const shapeX = el.x || 0;
+          const shapeY = el.y || 0;
+          const shapeW = el.width || 100;
+          const shapeH = el.height || 50;
+          
+          const textHeight = fontSize * 1.35;
+          
+          const labelElement: any = {
+            id: labelId,
+            type: 'text',
+            // Position text at shape's x, use shape's full width
+            // textAlign:'center' will center the text within this width
+            x: shapeX,
+            y: shapeY + (shapeH - textHeight) / 2,
+            width: shapeW,
+            height: textHeight,
+            text: labelText,
+            rawText: labelText,
+            originalText: labelText,
+            autoResize: true,
+            fontSize,
+            fontFamily: el.fontFamily || 1,
+            textAlign: 'center',
+            verticalAlign: 'middle',
+            containerId: id,
+            strokeColor: el.stroke || el.strokeColor || '#1e1e1e',
+            backgroundColor: 'transparent',
+            fillStyle: 'solid',
+            strokeWidth: 1,
+            roughness: 0,
+            opacity: 100,
+            angle: 0,
+            seed: Math.floor(Math.random() * 1000000),
+            version: 1,
+            versionNonce: Math.floor(Math.random() * 1000000),
+            isDeleted: false,
+            groupIds: el.groupIds || [],
+            frameId: null,
+            roundness: null,
+            boundElements: null,
+            updated: Date.now(),
+            link: null,
+            locked: false,
+          };
+          normalized.boundElements = [{ id: labelId, type: 'text' }];
+          normalizedElements.push(labelElement);
+        }
+      }
+    }
+
+    // Add all normalized elements to the session
+    for (const element of normalizedElements) {
+      const serverElement: ServerElement = {
+        ...element,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-        version: 1
       };
-      session.elements.set(id, element);
+      session.elements.set(element.id, serverElement);
     }
 
     // Export to image (with 5 min timeout)
