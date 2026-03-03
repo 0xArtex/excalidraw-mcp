@@ -815,8 +815,8 @@ app.post('/api/render', async (req: Request, res: Response) => {
           
           const textHeight = fontSize * 1.35;
           // Excalidraw's hand-drawn font has extra ascender space,
-          // so we add a small downward offset (~15% of fontSize) to visually center
-          const verticalFudge = fontSize * 0.15;
+          // so we add a small downward offset to visually center
+          const verticalFudge = fontSize * 0.10;
           
           const labelElement: any = {
             id: labelId,
