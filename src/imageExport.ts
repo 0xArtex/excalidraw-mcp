@@ -175,8 +175,115 @@ export async function exportSessionToImage(sessionId: string): Promise<{
     // Wait for Excalidraw to load
     await page.waitForSelector('.excalidraw', { timeout: 10000 });
     
-    // Wait a bit more for elements to render
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    // Generate filename early so export path can use it
+    const timestamp = Date.now();
+    const filename = `${sessionId}-${timestamp}.png`;
+    const imagePath = path.join(EXPORTS_DIR, filename);
+    
+    // Wait for Excalidraw to signal it's ready (set by App.tsx after scrollToContent)
+    try {
+      await page.waitForFunction(() => (window as any).__EXCALIDRAW_READY__ === true, { timeout: 8000 });
+      logger.info('Excalidraw signaled ready');
+    } catch {
+      logger.warn('Excalidraw ready signal timeout, proceeding anyway');
+    }
+    
+    // Extra wait for rendering to settle
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    // Use Excalidraw's standalone exportToBlob for pixel-perfect rendering
+    // This handles text centering, binding, and all layout correctly
+    // The standalone function is exposed on window.__EXCALIDRAW_EXPORT_TO_BLOB__
+    // and doesn't require the imperative API
+    const exportedPng = await page.evaluate(async () => {
+      const exportToBlob = (window as any).__EXCALIDRAW_EXPORT_TO_BLOB__;
+      if (!exportToBlob) {
+        console.warn('exportToBlob not found on window');
+        return null;
+      }
+      
+      // Get elements from the Excalidraw API if available, or from the DOM
+      let elements: any[] = [];
+      let appState: any = {};
+      
+      const api = (window as any).__EXCALIDRAW_API__;
+      if (api && api.getSceneElements) {
+        elements = api.getSceneElements();
+        appState = api.getAppState();
+      } else {
+        // Try to get elements from React fiber as last resort
+        const excalidrawEl = document.querySelector('.excalidraw');
+        if (excalidrawEl) {
+          const fiberKey = Object.keys(excalidrawEl).find(k => k.startsWith('__reactFiber'));
+          if (fiberKey) {
+            let fiber = (excalidrawEl as any)[fiberKey];
+            for (let i = 0; i < 80 && fiber; i++) {
+              // Look for memoizedState that has elements array
+              let state = fiber.memoizedState;
+              while (state) {
+                if (state.queue?.lastRenderedState?.getSceneElements) {
+                  const stateApi = state.queue.lastRenderedState;
+                  elements = stateApi.getSceneElements();
+                  appState = stateApi.getAppState();
+                  break;
+                }
+                state = state.next;
+              }
+              if (elements.length > 0) break;
+              fiber = fiber.return;
+            }
+          }
+        }
+      }
+      
+      if (!elements || elements.length === 0) {
+        console.warn('No elements found for export');
+        return null;
+      }
+      
+      try {
+        const blob = await exportToBlob({
+          elements,
+          appState: {
+            ...appState,
+            exportBackground: true,
+            viewBackgroundColor: appState.viewBackgroundColor || '#ffffff',
+          },
+          files: null,
+          mimeType: 'image/png',
+          quality: 1,
+        });
+        
+        if (blob) {
+          const reader = new FileReader();
+          return new Promise<string>((resolve) => {
+            reader.onloadend = () => resolve(reader.result as string);
+            reader.readAsDataURL(blob);
+          });
+        }
+      } catch (e) {
+        console.error('exportToBlob failed:', e);
+      }
+      return null;
+    });
+    
+    if (exportedPng) {
+      logger.info('Using Excalidraw native exportToBlob for pixel-perfect rendering');
+      // Use Excalidraw's native export - decode base64 data URL
+      const base64Data = exportedPng.split(',')[1] || '';
+      const pngBuffer = Buffer.from(base64Data, 'base64');
+      await fs.writeFile(imagePath, pngBuffer);
+      await page.close();
+      
+      return {
+        success: true,
+        imagePath,
+        imageUrl: `/exports/${filename}`
+      };
+    }
+    
+    logger.warn('exportToBlob failed or unavailable, falling back to screenshot');
+    // Fallback: screenshot approach (text may not be perfectly centered)
     
     // Find the canvas element and take a screenshot of just the drawing area
     const excalidrawElement = await page.$('.excalidraw');
@@ -185,10 +292,7 @@ export async function exportSessionToImage(sessionId: string): Promise<{
       throw new Error('Excalidraw canvas not found');
     }
     
-    // Generate filename
-    const timestamp = Date.now();
-    const filename = `${sessionId}-${timestamp}.png`;
-    const imagePath = path.join(EXPORTS_DIR, filename);
+    // imagePath and filename already declared above
     
     // Take screenshot
     await excalidrawElement.screenshot({

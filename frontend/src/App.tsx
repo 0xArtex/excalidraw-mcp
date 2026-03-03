@@ -148,7 +148,17 @@ const validateAndFixBindings = (elements: Partial<ExcalidrawElement>[]): Partial
 }
 
 function App(): JSX.Element {
+  // Expose standalone exportToBlob on window for Puppeteer export
+  useEffect(() => {
+    // Dynamic import to avoid tree-shaking
+    import('@excalidraw/excalidraw').then((mod) => {
+      (window as any).__EXCALIDRAW_EXPORT_TO_BLOB__ = mod.exportToBlob;
+      console.log('[Excalidraw] exportToBlob exposed on window, type:', typeof mod.exportToBlob);
+    });
+  }, []);
+
   const [excalidrawAPI, setExcalidrawAPI] = useState<ExcalidrawAPIRefValue | null>(null)
+  const excalidrawRef = useRef<ExcalidrawAPIRefValue | null>(null)
   const [isConnected, setIsConnected] = useState<boolean>(false)
   const websocketRef = useRef<WebSocket | null>(null)
   
@@ -195,8 +205,14 @@ function App(): JSX.Element {
           elements: convertedElements,
           captureUpdate: CaptureUpdateAction.NEVER
         })
-        // Zoom to fit after a short delay
-        setTimeout(() => excalidrawAPI.scrollToContent(undefined, { fitToContent: true }), 200)
+        // Zoom to fit after a short delay, then signal ready for screenshots
+        setTimeout(() => {
+          excalidrawAPI.scrollToContent(undefined, { fitToContent: true })
+          // Signal that rendering is complete (used by Puppeteer for screenshots)
+          setTimeout(() => {
+            (window as any).__EXCALIDRAW_READY__ = true
+          }, 500)
+        }, 300)
       } else {
         loadExistingElements()
         if (!isConnected) {
@@ -537,7 +553,7 @@ function App(): JSX.Element {
       {/* Canvas Container */}
       <div className="canvas-container">
         <Excalidraw
-          excalidrawAPI={(api: ExcalidrawAPIRefValue) => setExcalidrawAPI(api)}
+          excalidrawAPI={(api: ExcalidrawAPIRefValue) => { setExcalidrawAPI(api); (window as any).__EXCALIDRAW_API__ = api; }}
           initialData={{
             elements: [],
             appState: {
