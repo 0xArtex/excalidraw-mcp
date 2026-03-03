@@ -13,7 +13,7 @@ Let your AI agent run a live Excalidraw canvas and draw diagrams. This repo prov
 
 *AI agent creates a wireframe via MCP tools*
 
-![Agent Skill Demo](assets/demo-telegram.jpg)
+![Agent Skill Demo](assets/demo-telegram.gif)
 
 *OpenClaw agent renders a diagram and sends it to Telegram with an edit link*
 
