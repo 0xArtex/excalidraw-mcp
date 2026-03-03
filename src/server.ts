@@ -814,13 +814,16 @@ app.post('/api/render', async (req: Request, res: Response) => {
           const shapeH = el.height || 50;
           
           const textHeight = fontSize * 1.35;
+          // Excalidraw's hand-drawn font has extra ascender space,
+          // so we add a small downward offset (~15% of fontSize) to visually center
+          const verticalFudge = fontSize * 0.15;
           
           const labelElement: any = {
             id: labelId,
             type: 'text',
             // Position text at shape center; containerId + textAlign:center handles the rest
             x: shapeX + shapeW / 2,
-            y: shapeY + shapeH / 2 - textHeight / 2,
+            y: shapeY + shapeH / 2 - textHeight / 2 + verticalFudge,
             width: shapeW,
             height: textHeight,
             text: labelText,
