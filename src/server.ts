@@ -813,10 +813,10 @@ app.post('/api/render', async (req: Request, res: Response) => {
           const shapeW = el.width || 100;
           const shapeH = el.height || 50;
           
-          const textHeight = fontSize * 1.35;
-          // Excalidraw's hand-drawn font has extra ascender space,
-          // so we add a small downward offset to visually center
-          const verticalFudge = fontSize * 0.10;
+          // Excalidraw uses lineHeight 1.25 for hand-drawn font (fontFamily 1)
+          const lineHeight = 1.25;
+          const textHeight = fontSize * lineHeight;
+          const verticalFudge = 0; // no fudge needed with correct lineHeight
           
           const labelElement: any = {
             id: labelId,
@@ -832,6 +832,7 @@ app.post('/api/render', async (req: Request, res: Response) => {
             autoResize: true,
             fontSize,
             fontFamily: el.fontFamily || 1,
+            lineHeight,
             textAlign: 'center',
             verticalAlign: 'middle',
             containerId: id,
