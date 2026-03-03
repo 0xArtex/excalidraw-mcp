@@ -818,10 +818,9 @@ app.post('/api/render', async (req: Request, res: Response) => {
           const labelElement: any = {
             id: labelId,
             type: 'text',
-            // Position text at shape's x, use shape's full width
-            // textAlign:'center' will center the text within this width
-            x: shapeX,
-            y: shapeY + (shapeH - textHeight) / 2,
+            // Position text at shape center; containerId + textAlign:center handles the rest
+            x: shapeX + shapeW / 2,
+            y: shapeY + shapeH / 2 - textHeight / 2,
             width: shapeW,
             height: textHeight,
             text: labelText,
