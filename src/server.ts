@@ -816,7 +816,9 @@ app.post('/api/render', async (req: Request, res: Response) => {
           // Excalidraw uses lineHeight 1.25 for hand-drawn font (fontFamily 1)
           const lineHeight = 1.25;
           const textHeight = fontSize * lineHeight;
-          const verticalFudge = 0; // no fudge needed with correct lineHeight
+          // Font descender space makes text appear above center;
+          // offset proportionally to push visible cap-height to true center
+          const verticalFudge = fontSize * 0.56;
           
           const labelElement: any = {
             id: labelId,
